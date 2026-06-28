@@ -1,6 +1,6 @@
 # IBL2SVS
 
-[![Release](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml/badge.svg)](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml)
+[![Release](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml)
 
 **IBL2SVS** 是一个病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
 
