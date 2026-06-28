@@ -26,11 +26,11 @@ macOS 当前未做 Apple Developer 签名和 notarization。首次运行时可�
 | 输入 | 输出 Generic TIFF | 输出 SVS | 说明 |
 |----|----|----|----|
 | `.ibl` | 支持 | 支持 | 读取厂商 IBL SQLite/tile 数据 |
-| `.kfb` | 支持 | 支持 | 当前基于已解析的江丰 KFB JPEG tile 结构 |
+| `.kfb` | 支持 | 支持 | 当前基于已解析的 KFB JPEG tile 结构 |
 | `.svs` | 支持 | 不适用 | SVS 转 Generic Pyramidal TIFF |
 | `.tif/.tiff` | 不适用 | 支持 | Generic TIFF 转 Aperio-compatible SVS |
 
-KFB 支持采用保守重封装路径：`decode -> rebuild pyramid -> re-encode`。当前不会迁移标注或完整厂商私有 metadata；遇到新的 KFB 变体时可能需要补充解析逻辑。
+KFB 支持采用保守重封装路径：`decode -> rebuild pyramid -> re-encode`。当前不会迁移标注或完整厂商私有 metadata；遇到新的 KFB 变体时可能需要补充解析逻辑，欢迎提交修改意见。
 
 ## 快速开始
 
@@ -176,15 +176,6 @@ desktop\src-tauri\target\release\bundle\nsis
 - macOS：未签名 DMG。
 - `SHA256SUMS.txt`：发布文件校验和。
 
-发布示例：
-
-```bash
-git tag v0.3.0
-git push origin main
-git push origin v0.3.0
-```
-
-也可以在 GitHub Actions 页面手动运行 `Release` workflow，并填写要创建或更新的 tag。
 
 ## 依赖
 
@@ -211,9 +202,8 @@ Desktop:
 
 ## 已知限制
 
-- 第一版 Tauri 桌面端只支持一个转换任务同时运行。
 - GitHub Actions 会构建未签名 macOS DMG；正式分发前仍建议补充 Apple Developer 签名和 notarization。
-- KFB 解析目前覆盖当前已验证的江丰扫描仪 KFB 结构；不同厂商或不同版本 KFB 可能需要进一步适配。
+- KFB 解析目前覆盖当前已验证的 KFB 结构；不同厂商或不同版本 KFB 可能需要进一步适配。
 - Tauri app 不依赖用户本机 Python，但构建机需要 Python、Node.js、Rust 和 PyInstaller。
 
 ## 许可证
