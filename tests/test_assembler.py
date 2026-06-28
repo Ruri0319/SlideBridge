@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+from PIL import Image
+
+from ibl2svs.assembler import PILImageSource, iter_source_tiles
+
+
+class AssemblerTests(unittest.TestCase):
+    def test_iter_source_tiles_preserves_global_row_major_order(self) -> None:
+        image = np.zeros((16, 32, 3), dtype=np.uint8)
+        tile_index = 1
+        for tile_y in range(0, 16, 8):
+            for tile_x in range(0, 32, 8):
+                image[tile_y : tile_y + 8, tile_x : tile_x + 8] = (tile_index, 0, 0)
+                tile_index += 1
+
+        source = PILImageSource(Image.fromarray(image))
+        tiles = list(iter_source_tiles(source, 8, chunk_size=16))
+
+        self.assertEqual([int(tile[0, 0, 0]) for tile in tiles], [1, 2, 3, 4, 5, 6, 7, 8])
+
+
+if __name__ == "__main__":
+    unittest.main()
