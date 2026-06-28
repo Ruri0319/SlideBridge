@@ -103,6 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
     steps:
       - name: Download bundles
@@ -126,11 +127,12 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber --repo "$GH_REPO"
           else
             gh release create "$RELEASE_TAG" "${files[@]}" \
               --title "IBL2SVS ${RELEASE_TAG}" \
               --generate-notes \
-              --target "$GITHUB_SHA"
+              --target "$GITHUB_SHA" \
+              --repo "$GH_REPO"
           fi
