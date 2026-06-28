@@ -1,32 +1,40 @@
 # IBL2SVS
 
-**IBL2SVS** 将包含 `.ibl`、`.kfb`、`.svs`、`.tif/.tiff` 病理切片文件的文件夹批量转换为标准 Whole-Slide Image (WSI) 格式：**Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
+[![Release](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml/badge.svg)](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml)
 
-当前桌面端已迁移为 **React + Tauri v2**：Tauri 负责桌面窗口、目录选择、打开输出目录/报告和前端状态；Python sidecar 负责 IBL/SVS/TIFF 转换。
+**IBL2SVS** 是一个病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
+
+项目包含两层入口：
+
+- **桌面应用**：React + Tauri v2，面向日常批量转换。
+- **Python API / CLI**：面向脚本、调试和自动化流程。
+
+Python 转换核心负责 WSI 读取、金字塔重建、JPEG tile 编码和 CSV 报告；Tauri 桌面端通过 PyInstaller sidecar 调用转换核心，因此正式桌面发行包不要求用户额外安装 Python。
+
+## 下载
+
+Windows 和 macOS 构建产物会发布在 [GitHub Releases](https://github.com/Ruri0319/IBL2SVS/releases)。
+
+- Windows x64：NSIS 安装包。
+- macOS：未签名 DMG。
+- 每个 release 附带 `SHA256SUMS.txt` 校验和。
+
+macOS 当前未做 Apple Developer 签名和 notarization。首次运行时可能需要在系统安全设置中手动允许打开。
+
+## 支持格式
+
+| 输入 | 输出 Generic TIFF | 输出 SVS | 说明 |
+|----|----|----|----|
+| `.ibl` | 支持 | 支持 | 读取厂商 IBL SQLite/tile 数据 |
+| `.kfb` | 支持 | 支持 | 当前基于已解析的江丰 KFB JPEG tile 结构 |
+| `.svs` | 支持 | 不适用 | SVS 转 Generic Pyramidal TIFF |
+| `.tif/.tiff` | 不适用 | 支持 | Generic TIFF 转 Aperio-compatible SVS |
+
+KFB 支持采用保守重封装路径：`decode -> rebuild pyramid -> re-encode`。当前不会迁移标注或完整厂商私有 metadata；遇到新的 KFB 变体时可能需要补充解析逻辑。
 
 ## 快速开始
 
-### Python API
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-```python
-from ibl2svs import convert_file, ConvertOptions
-
-result = convert_file("sample.ibl", "output.tif", ConvertOptions())
-print(result.success, result.duration_sec)
-```
-
-```python
-from ibl2svs import convert_file, ConvertOptions
-
-result = convert_file("sample.ibl", "output.svs", ConvertOptions(output_format="svs"))
-print(result.success, result.backend)
-```
-
-### Tauri Desktop
+### 桌面开发版
 
 ```bash
 python -m pip install -r requirements.txt
@@ -35,23 +43,45 @@ npm install
 npm run tauri dev
 ```
 
-> Tauri 开发和打包需要本机安装 Rust/Cargo。Python 转换逻辑本身不需要 Rust。
+Tauri 开发和打包需要本机安装 Rust/Cargo。Python 转换逻辑本身不需要 Rust。
+
+### Python API
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+```python
+from ibl2svs import ConvertOptions, convert_file
+
+result = convert_file("sample.ibl", "output.tif", ConvertOptions())
+print(result.success, result.duration_sec)
+```
+
+```python
+from ibl2svs import ConvertOptions, convert_file
+
+result = convert_file(
+    "sample.kfb",
+    "output.svs",
+    ConvertOptions(output_format="svs"),
+)
+print(result.success, result.backend)
+```
 
 ## 桌面端架构
 
 ```text
 React / TypeScript UI
-  │
-  ├─ Tauri commands: start_conversion / cancel_conversion / worker_status
-  │
-  ├─ Tauri plugins: dialog / opener / shell
-  │
-  ▼
+  |
+  |- Tauri commands: start_conversion / cancel_conversion / worker_status
+  |- Tauri plugins: dialog / opener / shell
+  v
 Python sidecar: ibl2svs-worker
-  │
-  ├─ stdin: JSON Lines start / cancel / ping
-  ├─ stdout: JSON Lines ready / log / progress / done / error
-  ▼
+  |
+  |- stdin: JSON Lines start / cancel / ping
+  |- stdout: JSON Lines ready / log / progress / done / error
+  v
 ibl2svs.converter.convert_folder()
 ```
 
@@ -77,13 +107,6 @@ ibl2svs.converter.convert_folder()
 - RGB Adobe JPEG tile + JPEGTables 共享表。
 - OpenSlide / QuPath 兼容。
 
-### KFB/TIFF/SVS 互转
-
-- `.svs -> .tif` 输出 Generic Pyramidal TIFF。
-- `.tif/.tiff -> .svs` 输出 Aperio-compatible SVS。
-- `.kfb -> .tif/.svs` 输出 Generic Pyramidal TIFF 或 Aperio-compatible SVS。
-- 第一版采用保守重封装：decode -> rebuild pyramid -> re-encode，不迁移标注或完整私有 metadata。
-
 ## 项目结构
 
 ```text
@@ -104,7 +127,7 @@ desktop/
 tests/
 ├── test_backend_worker.py
 ├── test_converter.py
-├── test_writer.py
+├── test_kfb_source.py
 ├── test_tiff_source.py
 └── ...
 ```
@@ -157,7 +180,8 @@ desktop\src-tauri\target\release\bundle\nsis
 
 ```bash
 git tag v0.3.0
-git push origin main --tags
+git push origin main
+git push origin v0.3.0
 ```
 
 也可以在 GitHub Actions 页面手动运行 `Release` workflow，并填写要创建或更新的 tag。
@@ -189,8 +213,9 @@ Desktop:
 
 - 第一版 Tauri 桌面端只支持一个转换任务同时运行。
 - GitHub Actions 会构建未签名 macOS DMG；正式分发前仍建议补充 Apple Developer 签名和 notarization。
+- KFB 解析目前覆盖当前已验证的江丰扫描仪 KFB 结构；不同厂商或不同版本 KFB 可能需要进一步适配。
 - Tauri app 不依赖用户本机 Python，但构建机需要 Python、Node.js、Rust 和 PyInstaller。
 
 ## 免责声明
 
-本项目仅用于学术研究与技术交流目的。IBL 文件格式为厂商专有格式，本项目通过逆向工程方式实现格式解析与转换，不包含厂商私有代码、SDK 或商业机密。使用者应自行确保转换行为符合相关法律法规及与设备厂商的协议约定。
+本项目仅用于学术研究与技术交流目的。IBL/KFB 等文件格式可能包含厂商专有结构，本项目通过逆向工程方式实现格式解析与转换，不包含厂商私有代码、SDK 或商业机密。使用者应自行确保转换行为符合相关法律法规及与设备厂商的协议约定。
