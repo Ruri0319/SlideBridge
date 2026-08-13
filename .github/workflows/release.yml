@@ -34,7 +34,7 @@ jobs:
           - label: macOS
             os: macos-latest
             artifact_name: SlideBridge-macOS
-            tauri_args: "--ci --bundles dmg --no-sign"
+            tauri_args: "--ci --bundles dmg"
             bundle_path: "desktop/src-tauri/target/release/bundle/dmg/*.dmg"
 
     steps:
@@ -89,6 +89,22 @@ jobs:
       - name: Build Tauri bundle
         working-directory: desktop
         run: npm run tauri build -- ${{ matrix.tauri_args }}
+
+      - name: Verify macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dmg_path="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          mount_path="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_path" >/dev/null 2>&1 || true; rmdir "$mount_path" 2>/dev/null || true' EXIT
+          hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_path" >/dev/null
+          app_path="$mount_path/SlideBridge.app"
+          worker_path="$app_path/Contents/MacOS/slidebridge-worker"
+          file "$worker_path" | grep -q "Mach-O"
+          worker_output="$(printf '{\"type\":\"ping\"}\n' | "$worker_path")"
+          printf '%s\n' "$worker_output" | grep -q '"type": "ready"'
+          codesign --verify --deep --strict --verbose=2 "$app_path"
 
       - name: Upload release bundle
         uses: actions/upload-artifact@v4

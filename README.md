@@ -16,10 +16,15 @@ Python 转换核心负责 WSI 读取、金字塔重建、JPEG tile 编码和 CSV
 Windows 和 macOS 构建产物会发布在 [GitHub Releases](https://github.com/Ruri0319/SlideBridge/releases)。
 
 - Windows x64：NSIS 安装包。
-- macOS：未签名 DMG。
+- macOS：ad-hoc 签名 DMG。
 - 每个 release 附带 `SHA256SUMS.txt` 校验和。
 
-macOS 当前未做 Apple Developer 签名和 notarization。首次运行时可能需要在系统安全设置中手动允许打开。
+macOS 当前未做 Apple Developer ID 签名和 notarization。应用包会在构建时进行完整的 ad-hoc 签名，首次运行时仍可能需要在系统安全设置中手动允许打开。如果 Gatekeeper 将 GitHub 下载的应用标记为“已损坏”，可在把应用拖入“应用程序”后执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/SlideBridge.app
+open /Applications/SlideBridge.app
+```
 
 ## 支持格式
 
@@ -46,7 +51,7 @@ npm install
 npm run tauri dev
 ```
 
-Tauri 开发和打包需要本机安装 Rust/Cargo。Python 转换逻辑本身不需要 Rust。
+`tauri dev` 会先用当前已安装依赖的 Python 自动构建独立 sidecar；最终 `.app` 不依赖系统 `python` 命令。Tauri 开发和打包需要本机安装 Rust/Cargo。Python 转换逻辑本身不需要 Rust。
 
 ### Python API
 
@@ -177,7 +182,7 @@ desktop\src-tauri\target\release\bundle\nsis
 仓库已配置 `.github/workflows/release.yml`。推送 `v*` 标签时会自动构建并发布：
 
 - Windows x64：NSIS 安装包。
-- macOS：未签名 DMG。
+- macOS：ad-hoc 签名 DMG。
 - `SHA256SUMS.txt`：发布文件校验和。
 
 
@@ -206,7 +211,7 @@ Desktop:
 
 ## 已知限制
 
-- GitHub Actions 会构建未签名 macOS DMG；正式分发前仍建议补充 Apple Developer 签名和 notarization。
+- GitHub Actions 会对 macOS 应用进行完整的 ad-hoc 签名和校验；要消除首次启动安全提示，仍需补充 Apple Developer ID 签名和 notarization。
 - KFB 解析目前覆盖当前已验证的 KFB 结构；不同厂商或不同版本 KFB 可能需要进一步适配。
 - Tauri app 不依赖用户本机 Python，但构建机需要 Python、Node.js、Rust 和 PyInstaller。
 
