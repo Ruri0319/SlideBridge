@@ -153,7 +153,6 @@ button {
 .sidebar-footer,
 .topbar p,
 .phase-item p,
-.event-item p,
 .progress-card dt,
 .transcript-header,
 .settings-head p,
@@ -273,24 +272,12 @@ button {
 
 .task-flow {
   display: grid;
-  grid-template-rows: auto minmax(116px, 0.35fr) minmax(200px, 1fr);
+  grid-template-rows: auto minmax(200px, 1fr);
   gap: 14px;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   padding-right: 4px;
-}
-
-.task-flow.no-events {
-  grid-template-rows: auto auto minmax(200px, 1fr);
-}
-
-.task-flow.no-events .event-section {
-  display: block;
-}
-
-.task-flow.no-events .event-section h2 {
-  margin-bottom: 0;
 }
 
 .phase-list {
@@ -307,8 +294,7 @@ button {
   padding: 10px 2px;
 }
 
-.phase-dot,
-.event-dot {
+.phase-dot {
   width: 10px;
   height: 10px;
   margin-top: 4px;
@@ -316,68 +302,25 @@ button {
   background: var(--line);
 }
 
-.phase-item.active .phase-dot,
-.event-item.active .event-dot {
+.phase-item.active .phase-dot {
   background: var(--accent);
 }
 
-.phase-item.done .phase-dot,
-.event-item.success .event-dot {
+.phase-item.done .phase-dot {
   background: var(--success);
 }
 
-.event-item.warning .event-dot {
-  background: var(--warning);
-}
-
-.event-item.error .event-dot {
-  background: var(--error);
-}
-
-.phase-item strong,
-.event-item strong {
+.phase-item strong {
   color: var(--text);
   font-size: 13px;
 }
 
-.phase-item p,
-.event-item p {
+.phase-item p {
   margin: 4px 0 0;
   overflow: hidden;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.event-section h2 {
-  margin: 0 0 10px;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 650;
-}
-
-.event-section {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-height: 0;
-}
-
-.event-list {
-  display: grid;
-  gap: 10px;
-  min-height: 0;
-  overflow: auto;
-  padding-right: 4px;
-}
-
-.event-item {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 10px;
-  padding: 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
 }
 
 .soft,

@@ -75,13 +75,6 @@ export type ConversionEvent =
   | { type: "error"; job_id?: string | null; message: string; traceback?: string }
   | { type: "worker_terminated"; code?: number | null; signal?: number | null };
 
-export interface TaskEvent {
-  id: string;
-  title: string;
-  detail: string;
-  status: "idle" | "active" | "success" | "warning" | "error";
-}
-
 export interface ProgressState {
   running: boolean;
   statusText: string;

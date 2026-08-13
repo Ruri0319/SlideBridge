@@ -29,7 +29,6 @@ import type {
   ConversionEvent,
   OutputFormat,
   ProgressState,
-  TaskEvent,
   ThemeSettings,
   ViewKey,
 } from "./types";
@@ -97,10 +96,6 @@ function normalizePhase(value: string): string {
 function phaseToIndex(value: string): number {
   const index = phases.indexOf(normalizePhase(value));
   return index >= 0 ? index : 0;
-}
-
-function newEvent(title: string, detail = "", status: TaskEvent["status"] = "idle"): TaskEvent {
-  return { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, title, detail, status };
 }
 
 function initialPhaseStates(): PhaseDisplayState[] {
@@ -173,7 +168,6 @@ export default function App() {
   const [recursive, setRecursive] = useState(true);
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [phaseStates, setPhaseStates] = useState<PhaseDisplayState[]>(() => initialPhaseStates());
-  const [events, setEvents] = useState<TaskEvent[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
@@ -188,7 +182,6 @@ export default function App() {
   const lastBatchPercent = useRef(0);
   const batchFinished = useRef(false);
   const batchCancelled = useRef(false);
-  const emittedEventKeys = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     setActualTheme(themeResolution.theme);
@@ -214,14 +207,6 @@ export default function App() {
     };
   }, []);
 
-  function appendEvent(event: TaskEvent, key?: string) {
-    if (key) {
-      if (emittedEventKeys.current.has(key)) return;
-      emittedEventKeys.current.add(key);
-    }
-    setEvents((items) => [...items.slice(-29), event]);
-  }
-
   function appendLog(message: string) {
     setLogs((items) => [...items.slice(-299), message]);
   }
@@ -230,7 +215,6 @@ export default function App() {
     fileProgressByPath.current = new Map();
     filePhaseByPath.current = new Map();
     completedFiles.current = new Set();
-    emittedEventKeys.current = new Set();
     batchTotal.current = 0;
     completedCount.current = 0;
     lastBatchPercent.current = 0;
@@ -273,24 +257,14 @@ export default function App() {
     }
     if (event.type === "started") {
       setProgress((state) => ({ ...state, running: true, statusText: "Running" }));
-      appendEvent(newEvent("任务已启动", event.job_id, "active"), "task:started");
       return;
     }
     if (event.type === "report_path") {
       setProgress((state) => ({ ...state, reportPath: event.path }));
-      appendEvent(newEvent("日志已创建", event.path, "idle"), `report:${event.path}`);
       return;
     }
     if (event.type === "log") {
       appendLog(event.message);
-      const status = event.message.includes("失败") || event.message.toLowerCase().includes("error")
-        ? "error"
-        : event.message.includes("完成")
-          ? "success"
-          : event.message.includes("取消")
-            ? "warning"
-            : "idle";
-      if (status !== "idle") appendEvent(newEvent(event.message, "", status), `log:${status}:${event.message}`);
       return;
     }
     if (event.type === "overall") {
@@ -348,7 +322,6 @@ export default function App() {
           etaText: formatEta(state.startedAt, nextPercent),
         };
       });
-      appendEvent(newEvent(phase, basename(event.current), "active"), `phase:${event.current}:${phase}`);
       return;
     }
     if (event.type === "done") {
@@ -377,13 +350,6 @@ export default function App() {
         reportPath: batch.report_path || state.reportPath,
         backend: batch.results.length ? batch.results[batch.results.length - 1].backend : state.backend,
       }));
-      appendEvent(
-        newEvent(
-          batch.cancelled ? "转换已取消" : failed ? "转换完成，但有文件失败" : "转换完成",
-          `成功 ${batch.success_count} · 失败 ${batch.failed_count} · 取消 ${batch.cancelled_count}`,
-          batch.cancelled ? "warning" : failed ? "error" : "success",
-        ),
-      );
       return;
     }
     if (event.type === "error") {
@@ -391,7 +357,6 @@ export default function App() {
       batchCancelled.current = false;
       setProgress((state) => ({ ...state, running: false, statusText: "Error", currentPhase: "完成", etaText: "—" }));
       appendLog(event.traceback || event.message);
-      appendEvent(newEvent("转换失败", event.message, "error"));
       return;
     }
     if (event.type === "worker_terminated") {
@@ -404,7 +369,6 @@ export default function App() {
     if (!path) return;
     setInputDir(path);
     setProgress((state) => ({ ...state, currentFile: basename(path), statusText: "Idle" }));
-    appendEvent(newEvent("已选择输入目录", path, "active"));
   }
 
   async function pickOutput() {
@@ -412,7 +376,6 @@ export default function App() {
     if (!path) return;
     setOutputDir(path);
     setProgress((state) => ({ ...state, outputDir: path }));
-    appendEvent(newEvent("已选择输出目录", path, "idle"));
   }
 
   async function runConversion() {
@@ -420,8 +383,6 @@ export default function App() {
     const jobId = `job-${Date.now()}`;
     const settingsSnapshot = { ...conversionSettings };
     resetBatchAggregation();
-    emittedEventKeys.current.add("task:started");
-    setEvents([newEvent("任务已启动", `${inputDir} → ${outputDir}`, "active")]);
     setLogs([]);
     setTaskSettings(settingsSnapshot);
     setProgress({
@@ -448,14 +409,13 @@ export default function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setProgress((state) => ({ ...state, running: false, statusText: "Error" }));
-      appendEvent(newEvent("启动失败", message, "error"));
       appendLog(message);
     }
   }
 
   async function cancelCurrent() {
     await cancelConversion();
-    appendEvent(newEvent("已请求取消", "等待当前写入步骤安全结束", "warning"));
+    appendLog("已请求取消，等待当前写入步骤安全结束");
   }
 
   function updateTheme(next: ThemeSettings) {
@@ -474,7 +434,6 @@ export default function App() {
       await openFilesystemPath(path);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      appendEvent(newEvent(`${label}失败`, message, "error"));
       appendLog(`${label}失败: ${message}`);
     }
   }
@@ -519,7 +478,7 @@ export default function App() {
           />
         ) : (
           <div className="work-grid">
-            <section className={`task-flow ${events.length ? "" : "no-events"}`}>
+            <section className="task-flow">
               <div className="phase-list">
                 {phaseStates.map((phaseState) => (
                   <div
@@ -534,11 +493,6 @@ export default function App() {
                   </div>
                 ))}
               </div>
-
-              <section className="event-section">
-                <h2>转换日志</h2>
-                {events.length > 0 && <EventList events={events} />}
-              </section>
 
               <section className="transcript">
                 <div className="transcript-header">
@@ -587,22 +541,6 @@ function NavItem({ active, icon, label, onClick }: { active: boolean; icon: Reac
       {icon}
       <span>{label}</span>
     </button>
-  );
-}
-
-function EventList({ events }: { events: TaskEvent[] }) {
-  return (
-    <div className="event-list">
-      {events.map((event) => (
-        <article className={`event-item ${event.status}`} key={event.id}>
-          <span className="event-dot" />
-          <div>
-            <strong>{event.title}</strong>
-            {event.detail && <p>{event.detail}</p>}
-          </div>
-        </article>
-      ))}
-    </div>
   );
 }
 
