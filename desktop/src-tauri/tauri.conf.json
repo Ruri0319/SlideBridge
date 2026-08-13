@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "IBL2SVS",
+  "productName": "SlideBridge",
   "version": "0.3.0",
   "identifier": "com.ibl2svs.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "IBL2SVS",
+        "title": "镜渡 SlideBridge",
         "width": 1280,
         "height": 820,
         "minWidth": 1040,
@@ -29,12 +29,12 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.png", "../../assets/app.ico"],
-    "externalBin": ["binaries/ibl2svs-worker"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "externalBin": ["binaries/slidebridge-worker"],
     "windows": {
       "nsis": {
         "displayLanguageSelector": true,
-        "installerIcon": "../../assets/app.ico"
+        "installerIcon": "icons/icon.ico"
       }
     }
   }

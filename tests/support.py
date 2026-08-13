@@ -22,6 +22,76 @@ def jpeg_bytes(color: tuple[int, int, int], size: tuple[int, int], *, quality: i
     return buf.getvalue()
 
 
+def create_sample_image(path: Path, *, directional_tile: bool = False) -> None:
+    """Create a small file matching the investigated private .image layout."""
+    width = 512
+    height = 512
+    tile_size = 256
+    levels = [
+        (
+            2,
+            2,
+            [
+                (30, 40, 50),
+                (80, 90, 100),
+                (130, 140, 150),
+                (180, 190, 200),
+            ],
+        ),
+        (1, 1, [(100, 110, 120)]),
+    ]
+
+    header_size = 0xAC
+    header = bytearray(header_size)
+    struct.pack_into("<Q", header, 0x10, 0)
+    struct.pack_into("<f", header, 0x18, 0.3466053 * width)
+    struct.pack_into("<f", header, 0x1C, 0.3466053 * height)
+    struct.pack_into("<II", header, 0x20, width, height)
+    struct.pack_into("<I", header, 0x38, 40)
+    header[0x40 : 0x40 + len("2026-01-01 12:34:56")] = b"2026-01-01 12:34:56"
+    device = b"TEST-PUNUOXI"
+    struct.pack_into("<I", header, 0x53, len(device))
+    header[0x57 : 0x57 + len(device)] = device
+    header[0x84 : 0x84 + len("测试医院".encode("gbk"))] = "测试医院".encode("gbk")
+    header[0x98 : 0x98 + len("CASE-001")] = b"CASE-001"
+
+    payload = bytearray(header)
+    entries: list[tuple[int, int, int]] = []
+    for level_index, (columns, rows, colors) in enumerate(levels):
+        # The private container stores records column-major, while ``colors``
+        # is expressed in the more convenient row-major coordinate order.
+        for column in range(columns):
+            for row in range(rows):
+                color = colors[row * columns + column]
+                if directional_tile and level_index == 0 and column == 0 and row == 0:
+                    logical = Image.new("RGB", (tile_size, tile_size), color)
+                    logical.paste((220, 30, 40), (0, 0, tile_size // 2, tile_size // 2))
+                    logical.paste((30, 210, 50), (tile_size // 2, 0, tile_size, tile_size // 2))
+                    logical.paste((40, 60, 220), (0, tile_size // 2, tile_size // 2, tile_size))
+                    logical.paste((220, 210, 40), (tile_size // 2, tile_size // 2, tile_size, tile_size))
+                    stored = logical.transpose(Image.Transpose.TRANSPOSE)
+                    buffer = io.BytesIO()
+                    stored.save(buffer, format="JPEG", quality=100, subsampling=0)
+                    blob = buffer.getvalue()
+                else:
+                    blob = jpeg_bytes(color, (tile_size, tile_size), quality=100)
+                offset = len(payload)
+                payload.extend(blob)
+                entries.append((len(blob), offset, 0))
+
+    index_offset = len(payload)
+    struct.pack_into("<Q", payload, 0x10, index_offset)
+    entry_index = 0
+    for columns, rows, _colors in levels:
+        payload.extend(struct.pack("<II", columns, rows))
+        for _ in range(columns * rows):
+            payload.extend(struct.pack("<III", *entries[entry_index]))
+            entry_index += 1
+
+    payload.extend(b"0123456789abcdef0123456789abcdef\x00")
+    path.write_bytes(bytes(payload))
+
+
 def _kfb_image_record(image_type: int, blob: bytes, width: int, height: int) -> bytes:
     record = bytearray(52)
     record[0:4] = bytes([0xF1, image_type, 0xEE, 0xEE])

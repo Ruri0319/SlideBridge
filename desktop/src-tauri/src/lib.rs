@@ -102,7 +102,7 @@ async fn start_conversion(
 
     let command = app
         .shell()
-        .sidecar("ibl2svs-worker")
+        .sidecar("slidebridge-worker")
         .map_err(|error| CommandError::Worker(error.to_string()))?;
     let (mut receiver, mut child) = command
         .spawn()
@@ -203,5 +203,5 @@ pub fn run() {
             worker_status
         ])
         .run(tauri::generate_context!())
-        .expect("error while running IBL2SVS desktop app");
+        .expect("error while running SlideBridge desktop app");
 }

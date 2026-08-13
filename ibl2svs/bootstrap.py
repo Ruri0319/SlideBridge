@@ -14,6 +14,6 @@ def main(argv: list[str] | None = None) -> int:
         from .backend_worker import main as worker_main
 
         return worker_main()
-    print(f"{APP_NAME} no longer includes a Tkinter GUI.", file=sys.stderr)
+    print(f"{APP_NAME} uses a React/Tauri desktop GUI.", file=sys.stderr)
     print("Use the React/Tauri desktop app, or run with --worker for JSONL sidecar mode.", file=sys.stderr)
     return 2

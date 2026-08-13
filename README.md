@@ -1,8 +1,8 @@
-# IBL2SVS
+# 镜渡 SlideBridge
 
-[![Release](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Ruri0319/IBL2SVS/actions/workflows/release.yml)
+[![Release](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml)
 
-**IBL2SVS** 是一个病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
+**镜渡 SlideBridge** 是一个通用病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb`、`.image`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
 
 项目包含两层入口：
 
@@ -13,7 +13,7 @@ Python 转换核心负责 WSI 读取、金字塔重建、JPEG tile 编码和 CSV
 
 ## 下载
 
-Windows 和 macOS 构建产物会发布在 [GitHub Releases](https://github.com/Ruri0319/IBL2SVS/releases)。
+Windows 和 macOS 构建产物会发布在 [GitHub Releases](https://github.com/Ruri0319/SlideBridge/releases)。
 
 - Windows x64：NSIS 安装包。
 - macOS：未签名 DMG。
@@ -27,10 +27,13 @@ macOS 当前未做 Apple Developer 签名和 notarization。首次运行时可�
 |----|----|----|----|
 | `.ibl` | 支持 | 支持 | 读取厂商 IBL SQLite/tile 数据 |
 | `.kfb` | 支持 | 支持 | 当前基于已解析的 KFB JPEG tile 结构 |
+| `.image` | 支持 | 支持 | 读取已验证的私有 JPEG 瓦片金字塔结构 |
 | `.svs` | 支持 | 不适用 | SVS 转 Generic Pyramidal TIFF |
 | `.tif/.tiff` | 不适用 | 支持 | Generic TIFF 转 Aperio-compatible SVS |
 
 KFB 支持采用保守重封装路径：`decode -> rebuild pyramid -> re-encode`。当前不会迁移标注或完整厂商私有 metadata；遇到新的 KFB 变体时可能需要补充解析逻辑，欢迎提交修改意见。
+
+`.image` 支持采用同样的保守路径：按需读取主层 JPEG 瓦片，再由转换器重新建立输出金字塔。当前已验证该私有容器的固定头部、8 级列优先索引、像素轴转置的 256x256 RGB JPEG 瓦片和尾部标识；机构、病例号、设备号和扫描时间会作为扫描 metadata 读取，但不会原样写回厂商私有结构。
 
 ## 快速开始
 
@@ -77,7 +80,7 @@ React / TypeScript UI
   |- Tauri commands: start_conversion / cancel_conversion / worker_status
   |- Tauri plugins: dialog / opener / shell
   v
-Python sidecar: ibl2svs-worker
+Python sidecar: slidebridge-worker
   |
   |- stdin: JSON Lines start / cancel / ping
   |- stdout: JSON Lines ready / log / progress / done / error
@@ -88,7 +91,7 @@ ibl2svs.converter.convert_folder()
 - 前端文件位于 `desktop/src/`。
 - Tauri/Rust 桥接位于 `desktop/src-tauri/`。
 - Python sidecar 入口为 `ibl2svs/backend_worker.py` 和 `worker_main.py`。
-- Sidecar PyInstaller 配置为 `IBL2SVSWorker.spec`。
+- Sidecar PyInstaller 配置为 `SlideBridgeWorker.spec`。
 
 ## 输出格式
 
@@ -114,6 +117,7 @@ ibl2svs/
 ├── backend_worker.py    # Python sidecar JSONL worker
 ├── converter.py         # 文件扫描、单/批量转换、CSV 报告
 ├── kfb_source.py        # KFB JPEG 瓦片读取源
+├── punuoxi_source.py    # 私有 .image JPEG 金字塔读取源
 ├── models.py            # ConvertOptions / ConvertResult / BatchResult
 ├── reader.py            # IBL SQLite 读取
 ├── tiff_source.py       # WSI TIFF/SVS tile/strip 读取源
@@ -157,8 +161,8 @@ build_windows.bat C:\Path\To\python.exe
 构建脚本会：
 
 1. 安装 Python 依赖。
-2. 使用 PyInstaller 构建 `ibl2svs-worker.exe`。
-3. 复制 sidecar 到 `desktop\src-tauri\binaries\ibl2svs-worker-x86_64-pc-windows-msvc.exe`。
+2. 使用 PyInstaller 构建 `slidebridge-worker.exe`。
+3. 复制 sidecar 到 `desktop\src-tauri\binaries\slidebridge-worker-x86_64-pc-windows-msvc.exe`。
 4. 执行 `npm ci`。
 5. 执行 `npm run tauri build`。
 

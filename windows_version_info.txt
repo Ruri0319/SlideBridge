@@ -15,12 +15,12 @@ VSVersionInfo(
         StringTable(
           '040904B0',
           [
-            StringStruct('CompanyName', 'IBL2SVS'),
-            StringStruct('FileDescription', 'IBL2SVS whole-slide image converter'),
+            StringStruct('CompanyName', 'SlideBridge'),
+            StringStruct('FileDescription', 'SlideBridge universal whole-slide image converter'),
             StringStruct('FileVersion', '0.3.0.0'),
-            StringStruct('InternalName', 'IBL2SVS'),
-            StringStruct('OriginalFilename', 'IBL2SVS.exe'),
-            StringStruct('ProductName', 'IBL2SVS'),
+            StringStruct('InternalName', 'SlideBridge'),
+            StringStruct('OriginalFilename', 'SlideBridge.exe'),
+            StringStruct('ProductName', 'SlideBridge'),
             StringStruct('ProductVersion', '0.3.0.0')
           ]
         )

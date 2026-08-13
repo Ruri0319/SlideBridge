@@ -62,6 +62,39 @@ def get_process_memory_mb() -> float:
         return 0.0
 
 
+class ProcessMetricsSampler:
+    """Sample current process memory and CPU utilization without blocking."""
+
+    def __init__(self):
+        self._last_wall = time.perf_counter()
+        self._last_cpu = time.process_time()
+        self._cpu_count = max(1, os.cpu_count() or 1)
+        self._process = None
+        if psutil is not None:
+            try:
+                self._process = psutil.Process()
+                self._process.cpu_percent(interval=None)
+            except Exception:
+                self._process = None
+
+    def sample(self) -> tuple[float, float]:
+        now_wall = time.perf_counter()
+        now_cpu = time.process_time()
+        elapsed_wall = max(0.001, now_wall - self._last_wall)
+        elapsed_cpu = max(0.0, now_cpu - self._last_cpu)
+        self._last_wall = now_wall
+        self._last_cpu = now_cpu
+
+        cpu_percent = (elapsed_cpu / elapsed_wall) * 100.0 / self._cpu_count
+        if self._process is not None:
+            try:
+                cpu_percent = self._process.cpu_percent(interval=None) / self._cpu_count
+            except Exception:
+                self._process = None
+
+        return get_process_memory_mb(), min(100.0, max(0.0, cpu_percent))
+
+
 class PerfTracker:
     def __init__(self):
         self._started = time.perf_counter()

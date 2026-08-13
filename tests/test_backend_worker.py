@@ -37,7 +37,13 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertEqual(options.memory_budget_mb, 1024)
         self.assertEqual(options.tile_size, 16)
         self.assertEqual(options.jpeg_quality, 100)
-        self.assertEqual(options.parallel_wsi, 4)
+        self.assertEqual(options.parallel_wsi, 8)
+
+    def test_options_from_request_accepts_parallel_wsi_upper_limit(self) -> None:
+        options = options_from_request({"parallel_wsi": 8})
+
+        self.assertEqual(options.parallel_wsi, 8)
+        self.assertEqual(options.resolved_parallel_wsi(), 8)
 
     def test_serialize_result_converts_paths_to_strings(self) -> None:
         result = ConvertResult(
@@ -115,6 +121,10 @@ class BackendWorkerTests(unittest.TestCase):
 
         events = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(events[0]["type"], "started")
+        performance = next(event for event in events if event["type"] == "performance")
+        self.assertGreaterEqual(performance["memory_mb"], 0)
+        self.assertGreaterEqual(performance["cpu_percent"], 0)
+        self.assertLessEqual(performance["cpu_percent"], 100)
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["job_id"], "job-1")
 

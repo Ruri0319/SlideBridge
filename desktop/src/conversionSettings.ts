@@ -1,6 +1,7 @@
 import type { ConversionSettings } from "./types";
 
-const SETTINGS_KEY = "ibl2svs.conversion.settings";
+const SETTINGS_KEY = "slidebridge.conversion.settings";
+const LEGACY_SETTINGS_KEY = "ibl2svs.conversion.settings";
 
 export const defaultConversionSettings: ConversionSettings = {
   parallel_wsi: 1,
@@ -16,7 +17,7 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 
 export function normalizeConversionSettings(settings: Partial<ConversionSettings>): ConversionSettings {
   return {
-    parallel_wsi: clampNumber(settings.parallel_wsi, defaultConversionSettings.parallel_wsi, 1, 4),
+    parallel_wsi: clampNumber(settings.parallel_wsi, defaultConversionSettings.parallel_wsi, 1, 8),
     jpeg_quality: clampNumber(settings.jpeg_quality, defaultConversionSettings.jpeg_quality, 1, 100),
     memory_budget_mb: clampNumber(settings.memory_budget_mb, defaultConversionSettings.memory_budget_mb, 1024, 65536),
   };
@@ -24,7 +25,7 @@ export function normalizeConversionSettings(settings: Partial<ConversionSettings
 
 export function loadConversionSettings(): ConversionSettings {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    const raw = localStorage.getItem(SETTINGS_KEY) ?? localStorage.getItem(LEGACY_SETTINGS_KEY);
     if (!raw) return defaultConversionSettings;
     return normalizeConversionSettings(JSON.parse(raw));
   } catch {

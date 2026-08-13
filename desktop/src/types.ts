@@ -60,6 +60,7 @@ export type ConversionEvent =
   | { type: "log"; job_id?: string | null; message: string }
   | { type: "report_path"; job_id?: string; path: string }
   | { type: "overall"; job_id?: string; done: number; total: number; current: string }
+  | { type: "performance"; job_id?: string; memory_mb: number; cpu_percent: number }
   | {
       type: "file_progress";
       job_id?: string;
@@ -93,7 +94,8 @@ export interface ProgressState {
   batchTotal: number;
   etaText: string;
   backend: string;
-  memoryText: string;
+  memoryMb: number;
+  cpuPercent: number;
   reportPath: string;
   outputDir: string;
   startedAt: number | null;

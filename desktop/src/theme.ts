@@ -1,6 +1,7 @@
 import type { ActualTheme, ThemeMode, ThemeSettings } from "./types";
 
-const SETTINGS_KEY = "ibl2svs.theme.settings";
+const SETTINGS_KEY = "slidebridge.theme.settings";
+const LEGACY_SETTINGS_KEY = "ibl2svs.theme.settings";
 
 export const defaultThemeSettings: ThemeSettings = {
   mode: "auto",
@@ -8,7 +9,7 @@ export const defaultThemeSettings: ThemeSettings = {
 
 export function loadThemeSettings(): ThemeSettings {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    const raw = localStorage.getItem(SETTINGS_KEY) ?? localStorage.getItem(LEGACY_SETTINGS_KEY);
     if (!raw) return defaultThemeSettings;
     return { ...defaultThemeSettings, ...JSON.parse(raw) };
   } catch {

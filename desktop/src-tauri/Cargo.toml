@@ -1,13 +1,13 @@
 [package]
-name = "ibl2svs-desktop"
+name = "slidebridge-desktop"
 version = "0.3.0"
-description = "IBL/SVS/TIFF WSI converter"
-authors = ["IBL2SVS"]
+description = "Universal whole-slide image converter"
+authors = ["SlideBridge"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "ibl2svs_desktop_lib"
+name = "slidebridge_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

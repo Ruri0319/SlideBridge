@@ -21,6 +21,7 @@ desktop/src-tauri/binaries/*
 *.tiff
 *.tif
 *.ibl
+*.image
 *.log
 conversion_report.csv
 acceptance/
@@ -30,5 +31,8 @@ ibl_layer*.jpg
 ibl_block_*.png
 ibl_to_tiff.py
 test_data/
+/.Rhistory
+/punuoxi/
+/test/
 
 .DS_Store

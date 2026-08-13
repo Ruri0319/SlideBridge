@@ -7,7 +7,7 @@ import sys
 
 def configure_libvips() -> None:
     candidates: list[Path] = []
-    env_dir = os.getenv("IBL2SVS_LIBVIPS_DIR")
+    env_dir = os.getenv("SLIDEBRIDGE_LIBVIPS_DIR", os.getenv("IBL2SVS_LIBVIPS_DIR"))
     if env_dir:
         candidates.append(Path(env_dir))
 

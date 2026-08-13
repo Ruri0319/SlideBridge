@@ -1,14 +1,14 @@
-IBL2SVS React/Tauri Desktop
-===========================
+镜渡 SlideBridge React/Tauri Desktop
+=====================================
 
 用途
 ----
-选择一个包含 .ibl / .kfb / .svs / .tif / .tiff 文件的输入文件夹，再选择输出文件夹，程序会批量转换为带金字塔层级的 Aperio SVS 或 Generic TIFF 文件。
+选择一个包含 .ibl / .kfb / .image / .svs / .tif / .tiff 文件的输入文件夹，再选择输出文件夹，程序会批量转换为带金字塔层级的 Aperio SVS 或 Generic TIFF 文件。
 
 架构
 ----
 - React + Tauri v2 负责桌面界面、目录选择、打开输出目录/报告和前端状态。
-- Python sidecar 负责 IBL/SVS/TIFF 转换，通过 JSON Lines 向 Tauri 回传日志、进度和结果。
+- Python sidecar 负责 IBL/KFB/.image/SVS/TIFF 转换，通过 JSON Lines 向 Tauri 回传日志、进度和结果。
 - 转换核心仍使用 ibl2svs.converter / writer / reader，不依赖 Tkinter。
 
 运行环境
@@ -58,12 +58,12 @@ GitHub Release
 --------
 - 转换后的 .tif 或 .svs 文件。
 - conversion_report.csv 批处理报告。
-- ibl2svs_*.log 运行日志。
+- slidebridge_*.log 运行日志。
 
 WSI TIFF/SVS 互转
 -----------------
-- 输出 SVS 时读取 .ibl / .kfb / .tif / .tiff。
-- 输出 Generic TIFF 时读取 .ibl / .kfb / .svs。
+- 输出 SVS 时读取 .ibl / .kfb / .image / .tif / .tiff。
+- 输出 Generic TIFF 时读取 .ibl / .kfb / .image / .svs。
 - TIFF/SVS 输入采用保守重封装：重新生成金字塔，不迁移标注或完整私有 metadata。
 
 注意事项

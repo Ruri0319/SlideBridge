@@ -1,3 +1,3 @@
 fn main() {
-    ibl2svs_desktop_lib::run()
+    slidebridge_desktop_lib::run()
 }

@@ -362,7 +362,7 @@ def _advance_write_tail_progress(
 
 
 def _make_temp_path(directory: Path | None, suffix: str) -> Path:
-    fd, raw_path = tempfile.mkstemp(prefix="ibl2svs_flat_", suffix=suffix, dir=directory)
+    fd, raw_path = tempfile.mkstemp(prefix="slidebridge_flat_", suffix=suffix, dir=directory)
     os.close(fd)
     return Path(raw_path)
 
@@ -515,6 +515,8 @@ def _build_label_array(slide: IBLSlide) -> np.ndarray:
     if isinstance(scan_time, (int, float)) and int(scan_time) > 0:
         from datetime import datetime, timezone
         scan_time = datetime.fromtimestamp(int(scan_time), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    elif isinstance(scan_time, str):
+        scan_time = scan_time.strip()
     else:
         scan_time = ""
     lines = [slide.path.stem, f"MPP {slide.base_info.mpp:.4f}  AppMag {slide.base_info.max_zoom_rate}"]

@@ -1,11 +1,17 @@
 # Release Notes
 
+## Unreleased
+
+- 项目正式更名为 **镜渡 SlideBridge**，定位为通用 WSI 格式转换工具。
+- 更新桌面应用、安装包、运行横幅、日志及 GitHub Release 产物品牌。
+- 保留 Python 包导入路径 `ibl2svs` 和旧版构建环境变量作为兼容接口。
+
 ## 0.3.0
 
 - **桌面端架构迁移**：
   - 用 React + Tauri v2 替换 Tkinter GUI
   - Python 转换核心改为 PyInstaller sidecar，通过 JSON Lines 向 Tauri 回传日志、进度和结果
-  - Windows 打包链路改为先构建 `ibl2svs-worker.exe`，再执行 Tauri NSIS 打包
+  - Windows 打包链路改为先构建 Python worker，再执行 Tauri NSIS 打包
 - **重写 SVS 写出路径**：零临时文件、单次 IBL 读取、流式写出 Aperio SVS
   - 移除旧 pyvips-hybrid / experimental-fallback 双路径
   - 新增 `StripDownsampleDrive` 同时执行主图 tile 迭代与 4× 内存降采样

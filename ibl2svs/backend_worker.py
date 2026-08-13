@@ -13,6 +13,7 @@ from typing import Any, TextIO
 from .app_meta import runtime_banner
 from .converter import convert_folder
 from .models import BatchResult, ConvertOptions, ConvertResult
+from .system_metrics import ProcessMetricsSampler
 
 
 class WorkerProtocolError(ValueError):
@@ -82,7 +83,7 @@ def options_from_request(payload: dict[str, Any]) -> ConvertOptions:
         memory_budget_mb=_bounded_int(payload, "memory_budget_mb", 6144, 1024, 65536),
         tile_size=_bounded_int(payload, "tile_size", 256, 16, 4096),
         jpeg_quality=_bounded_int(payload, "jpeg_quality", 90, 1, 100),
-        parallel_wsi=_bounded_int(payload, "parallel_wsi", 1, 1, 4),
+        parallel_wsi=_bounded_int(payload, "parallel_wsi", 1, 1, 8),
     )
 
 
@@ -160,9 +161,33 @@ class BackendWorker:
             self._cancel_event.set()
             self.emit("log", job_id=self._current_job_id, message="收到取消请求，等待当前步骤安全结束")
 
+    def _start_performance_monitor(self, job_id: str) -> tuple[threading.Event, threading.Thread]:
+        stop_event = threading.Event()
+        sampler = ProcessMetricsSampler()
+
+        def emit_sample() -> None:
+            memory_mb, cpu_percent = sampler.sample()
+            self.emit(
+                "performance",
+                job_id=job_id,
+                memory_mb=round(memory_mb, 1),
+                cpu_percent=round(cpu_percent, 1),
+            )
+
+        emit_sample()
+
+        def monitor() -> None:
+            while not stop_event.wait(1.0):
+                emit_sample()
+
+        thread = threading.Thread(target=monitor, daemon=True, name="slidebridge-performance")
+        thread.start()
+        return stop_event, thread
+
     def _run_job(self, job_id: str, input_dir: Path, output_dir: Path, options: ConvertOptions) -> None:
-        log_path = output_dir / f"ibl2svs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_path = output_dir / f"slidebridge_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         log_lock = threading.Lock()
+        metrics_stop, metrics_thread = self._start_performance_monitor(job_id)
 
         def log(message: str) -> None:
             formatted = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
@@ -197,10 +222,16 @@ class BackendWorker:
                 ),
                 cancel_event=self._cancel_event,
             )
+            metrics_stop.set()
+            metrics_thread.join(timeout=2)
             self.emit("done", job_id=job_id, batch=serialize_batch(batch))
         except Exception as exc:
+            metrics_stop.set()
+            metrics_thread.join(timeout=2)
             self.emit("error", job_id=job_id, message=str(exc), traceback=traceback.format_exc())
         finally:
+            metrics_stop.set()
+            metrics_thread.join(timeout=2)
             with self._lock:
                 self._current_job_id = None
                 self._thread = None

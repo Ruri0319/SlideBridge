@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import replace
 from pathlib import Path
 
 from .app_meta import runtime_banner
 from .kfb_source import KfbSlideSource
 from .models import BatchResult, ConvertOptions, ConvertResult
+from .punuoxi_source import PunuoxiImageSource
 from .reader import IBLSlide
 from .tiff_source import TiffSlideSource
 from .writer import WriteImageError, write_image
@@ -46,6 +48,8 @@ def detect_input_format(path: str | Path) -> str:
         return "generic_tiff"
     if suffix == ".kfb":
         return "kfb"
+    if suffix == ".image":
+        return "image"
     return "unsupported"
 
 
@@ -57,9 +61,9 @@ def find_convertible_files(
     input_dir = Path(input_dir)
     pattern = "**/*" if recursive else "*"
     if output_format == "svs":
-        suffixes = {".ibl", ".tif", ".tiff", ".kfb"}
+        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".image"}
     else:
-        suffixes = {".ibl", ".svs", ".kfb"}
+        suffixes = {".ibl", ".svs", ".kfb", ".image"}
     files = [
         path
         for path in input_dir.glob(pattern)
@@ -228,6 +232,8 @@ def convert_file(
             slide_context = IBLSlide(input_path, cache_size=options.cache_blocks_per_row)
         elif input_format == "kfb":
             slide_context = KfbSlideSource(input_path, cache_size=options.cache_blocks_per_row or 256)
+        elif input_format == "image":
+            slide_context = PunuoxiImageSource(input_path, cache_size=options.cache_blocks_per_row or 256)
         else:
             slide_context = TiffSlideSource(input_path)
 
@@ -430,7 +436,18 @@ def convert_folder(
         completed = 0
         stop_submitting = False
         cancel_logged = False
+        active_parallel_wsi = min(parallel_wsi, len(output_plan))
+        task_options = replace(
+            options,
+            memory_budget_mb=max(1, options.memory_budget_mb // active_parallel_wsi),
+        )
         running: dict[Future[ConvertResult], tuple[int, Path]] = {}
+
+        if logger:
+            logger(
+                f"内存预算: 总计 {options.memory_budget_mb} MB, "
+                f"每个并发 WSI {task_options.memory_budget_mb} MB"
+            )
 
         def submit_next(executor: ThreadPoolExecutor) -> None:
             nonlocal pending_index
@@ -442,14 +459,14 @@ def convert_folder(
                 convert_file,
                 input_path,
                 output_path,
-                options,
+                task_options,
                 logger,
                 progress_callback,
                 cancel_event,
             )
             running[future] = (index, input_path)
 
-        with ThreadPoolExecutor(max_workers=parallel_wsi, thread_name_prefix="ibl2svs-wsi") as executor:
+        with ThreadPoolExecutor(max_workers=parallel_wsi, thread_name_prefix="slidebridge-wsi") as executor:
             while len(running) < parallel_wsi and pending_index < len(output_plan):
                 submit_next(executor)
 

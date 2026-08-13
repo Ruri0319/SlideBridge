@@ -1,7 +1,6 @@
 import {
   ChevronRight,
   Folder,
-  FolderOpen,
   Moon,
   Play,
   RotateCcw,
@@ -35,7 +34,7 @@ import type {
   ViewKey,
 } from "./types";
 
-const phases = ["待开始", "解析 IBL", "构建主图", "生成金字塔", "生成缩略图", "生成附属图像", "写出文件", "完成"];
+const phases = ["待开始", "解析输入", "构建主图", "生成金字塔", "生成缩略图", "生成附属图像", "写出文件", "完成"];
 type PhaseUiState = "done" | "active" | "idle";
 type PhaseDisplayState = {
   phase: string;
@@ -55,7 +54,8 @@ const initialProgress: ProgressState = {
   batchTotal: 0,
   etaText: "—",
   backend: "—",
-  memoryText: "—",
+  memoryMb: 0,
+  cpuPercent: 0,
   reportPath: "",
   outputDir: "",
   startedAt: null,
@@ -70,8 +70,21 @@ function formatPercent(done: number, total: number): number {
   return Math.min(100, Math.max(0, (done / total) * 100));
 }
 
+function formatEta(startedAt: number | null, percent: number): string {
+  if (!startedAt || percent <= 0) return "计算中";
+  if (percent >= 100) return "已完成";
+  const elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000);
+  if (elapsedSeconds < 1) return "计算中";
+  const remainingSeconds = Math.max(0, Math.round((elapsedSeconds * (100 - percent)) / percent));
+  if (remainingSeconds < 60) return `${remainingSeconds} 秒`;
+  if (remainingSeconds < 3600) return `${Math.floor(remainingSeconds / 60)} 分 ${remainingSeconds % 60} 秒`;
+  const hours = Math.floor(remainingSeconds / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+  return `${hours} 小时 ${minutes} 分`;
+}
+
 function normalizePhase(value: string): string {
-  if (value.includes("解析")) return "解析 IBL";
+  if (value.includes("解析")) return "解析输入";
   if (value.includes("主图")) return "构建主图";
   if (value.includes("金字塔")) return "生成金字塔";
   if (value.includes("缩略图")) return "生成缩略图";
@@ -164,6 +177,7 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
+  const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
   const fileProgressByPath = useRef<Map<string, number>>(new Map());
@@ -296,6 +310,16 @@ export default function App() {
         batchDone: completedCount.current,
         batchTotal: event.total,
         batchPercent: nextPercent,
+        etaText: formatEta(state.startedAt, nextPercent),
+      }));
+      return;
+    }
+    if (event.type === "performance") {
+      setProgress((state) => ({
+        ...state,
+        memoryMb: Math.max(0, event.memory_mb),
+        cpuPercent: Math.min(100, Math.max(0, event.cpu_percent)),
+        etaText: state.running ? formatEta(state.startedAt, state.batchPercent) : state.etaText,
       }));
       return;
     }
@@ -321,6 +345,7 @@ export default function App() {
           batchDone: completedCount.current,
           batchTotal: batchTotal.current || state.batchTotal,
           batchPercent: nextPercent,
+          etaText: formatEta(state.startedAt, nextPercent),
         };
       });
       appendEvent(newEvent(phase, basename(event.current), "active"), `phase:${event.current}:${phase}`);
@@ -328,6 +353,7 @@ export default function App() {
     }
     if (event.type === "done") {
       const batch = event.batch;
+      const failed = batch.failed_count > 0;
       batchFinished.current = true;
       batchCancelled.current = batch.cancelled;
       batchTotal.current = batch.total_files;
@@ -342,19 +368,20 @@ export default function App() {
       setProgress((state) => ({
         ...state,
         running: false,
-        statusText: batch.cancelled ? "Cancelled" : "Ready",
-        currentPhase: batch.cancelled ? "已取消" : summarizeBatchPhase(nextPhaseStates),
+        statusText: batch.cancelled ? "Cancelled" : failed ? "Error" : "Ready",
+        currentPhase: batch.cancelled ? "已取消" : failed ? "转换失败" : summarizeBatchPhase(nextPhaseStates),
         batchDone: completedCount.current,
         batchTotal: batch.total_files,
         batchPercent: batch.cancelled ? state.batchPercent : 100,
+        etaText: batch.cancelled || failed ? "—" : "已完成",
         reportPath: batch.report_path || state.reportPath,
         backend: batch.results.length ? batch.results[batch.results.length - 1].backend : state.backend,
       }));
       appendEvent(
         newEvent(
-          batch.cancelled ? "转换已取消" : "转换完成",
+          batch.cancelled ? "转换已取消" : failed ? "转换完成，但有文件失败" : "转换完成",
           `成功 ${batch.success_count} · 失败 ${batch.failed_count} · 取消 ${batch.cancelled_count}`,
-          batch.cancelled ? "warning" : "success",
+          batch.cancelled ? "warning" : failed ? "error" : "success",
         ),
       );
       return;
@@ -362,7 +389,7 @@ export default function App() {
     if (event.type === "error") {
       batchFinished.current = true;
       batchCancelled.current = false;
-      setProgress((state) => ({ ...state, running: false, statusText: "Error", currentPhase: "完成" }));
+      setProgress((state) => ({ ...state, running: false, statusText: "Error", currentPhase: "完成", etaText: "—" }));
       appendLog(event.traceback || event.message);
       appendEvent(newEvent("转换失败", event.message, "error"));
       return;
@@ -391,10 +418,12 @@ export default function App() {
   async function runConversion() {
     if (!inputDir || !outputDir || progress.running) return;
     const jobId = `job-${Date.now()}`;
+    const settingsSnapshot = { ...conversionSettings };
     resetBatchAggregation();
     emittedEventKeys.current.add("task:started");
     setEvents([newEvent("任务已启动", `${inputDir} → ${outputDir}`, "active")]);
     setLogs([]);
+    setTaskSettings(settingsSnapshot);
     setProgress({
       ...initialProgress,
       running: true,
@@ -411,10 +440,10 @@ export default function App() {
         output_dir: outputDir,
         output_format: outputFormat,
         recursive,
-        memory_budget_mb: conversionSettings.memory_budget_mb,
+        memory_budget_mb: settingsSnapshot.memory_budget_mb,
         tile_size: 256,
-        jpeg_quality: conversionSettings.jpeg_quality,
-        parallel_wsi: conversionSettings.parallel_wsi,
+        jpeg_quality: settingsSnapshot.jpeg_quality,
+        parallel_wsi: settingsSnapshot.parallel_wsi,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -440,6 +469,16 @@ export default function App() {
     saveConversionSettings(normalized);
   }
 
+  async function openPathWithFeedback(path: string, label: string) {
+    try {
+      await openFilesystemPath(path);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendEvent(newEvent(`${label}失败`, message, "error"));
+      appendLog(`${label}失败: ${message}`);
+    }
+  }
+
   const canStart = Boolean(inputDir && outputDir && !progress.running);
 
   return (
@@ -448,12 +487,12 @@ export default function App() {
         <div className="brand">
           <div className="brand-mark">I</div>
           <div>
-            <strong>IBL2SVS</strong>
-            <span>WSI conversion</span>
+            <strong>镜渡 SlideBridge</strong>
+            <span>Universal WSI Converter</span>
           </div>
         </div>
         <nav className="nav-list">
-          <NavItem active={view === "new"} icon={<ChevronRight size={16} />} label="新建转换任务" onClick={() => setView("new")} />
+          <NavItem active={view === "new"} icon={<ChevronRight size={16} />} label="转换任务" onClick={() => setView("new")} />
           <NavItem active={view === "settings"} icon={<Settings size={16} />} label="设置" onClick={() => setView("settings")} />
         </nav>
         <div className="sidebar-footer">
@@ -475,13 +514,12 @@ export default function App() {
           <SettingsView
             settings={themeSettings}
             conversionSettings={conversionSettings}
-            hint={themeResolution.hint}
             onChange={updateTheme}
             onConversionChange={updateConversionSettings}
           />
         ) : (
           <div className="work-grid">
-            <section className="task-flow">
+            <section className={`task-flow ${events.length ? "" : "no-events"}`}>
               <div className="phase-list">
                 {phaseStates.map((phaseState) => (
                   <div
@@ -499,18 +537,7 @@ export default function App() {
 
               <section className="event-section">
                 <h2>转换日志</h2>
-                {events.length ? (
-                  <EventList events={events} />
-                ) : (
-                  <div className="empty-state">
-                    <FolderOpen size={22} />
-                    <div className="empty-state-copy">
-                      <strong>未选择任务</strong>
-                      <p>选择输入目录后，转换事件会在这里形成一条可追踪的执行流。</p>
-                    </div>
-                    <button onClick={pickInput}>选择输入目录</button>
-                  </div>
-                )}
+                {events.length > 0 && <EventList events={events} />}
               </section>
 
               <section className="transcript">
@@ -524,6 +551,7 @@ export default function App() {
 
             <aside className="summary-panel">
               <ProgressSummary progress={progress} />
+              <PerformanceSummary progress={progress} settings={taskSettings ?? conversionSettings} />
             </aside>
           </div>
         )}
@@ -544,8 +572,8 @@ export default function App() {
             onRecursive={setRecursive}
             onStart={runConversion}
             onCancel={cancelCurrent}
-            onOpenOutput={() => openFilesystemPath(outputDir)}
-            onOpenReport={() => openFilesystemPath(progress.reportPath)}
+            onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
+            onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
           />
         )}
       </main>
@@ -610,6 +638,66 @@ function ProgressSummary({ progress }: { progress: ProgressState }) {
   );
 }
 
+function PerformanceSummary({
+  progress,
+  settings,
+}: {
+  progress: ProgressState;
+  settings: ConversionSettings;
+}) {
+  const memoryPercent = settings.memory_budget_mb > 0
+    ? Math.min(100, (progress.memoryMb / settings.memory_budget_mb) * 100)
+    : 0;
+  const cpuPercent = Math.min(100, Math.max(0, progress.cpuPercent));
+
+  return (
+    <section className="performance-card">
+      <h2>性能监控</h2>
+      <dl className="performance-text-metrics">
+        <div>
+          <dt>并发 WSI 数量</dt>
+          <dd>{settings.parallel_wsi}</dd>
+        </div>
+        <div>
+          <dt>JPG 质量</dt>
+          <dd>{settings.jpeg_quality}</dd>
+        </div>
+        <div>
+          <dt>ETA</dt>
+          <dd>{progress.running ? progress.etaText : progress.statusText === "Ready" ? "已完成" : "—"}</dd>
+        </div>
+      </dl>
+      <PerformanceBar
+        label="内存消耗"
+        value={`${Math.round(progress.memoryMb)} / ${settings.memory_budget_mb} MB`}
+        percent={memoryPercent}
+      />
+      <PerformanceBar label="CPU 占用" value={`${Math.round(cpuPercent)}%`} percent={cpuPercent} />
+    </section>
+  );
+}
+
+function PerformanceBar({ label, value, percent }: { label: string; value: string; percent: number }) {
+  return (
+    <div className="performance-metric">
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+      </div>
+      <div
+        className="performance-bar"
+        role="progressbar"
+        aria-label={`${label} ${value}`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(Math.min(100, Math.max(0, percent)))}
+      >
+        <i style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function TaskComposer({
   inputDir,
   outputDir,
@@ -648,8 +736,15 @@ function TaskComposer({
   return (
     <section className="composer">
       <div className="path-row">
-        <PathButton label="输入目录" value={inputDir || "选择包含 IBL / KFB / SVS / TIFF 的文件夹"} onClick={onInput} />
+        <PathButton label="输入目录" value={inputDir || "选择包含 IBL / KFB / IMAGE / SVS / TIFF 的文件夹"} onClick={onInput} />
         <PathButton label="输出目录" value={outputDir || "选择转换结果保存位置"} onClick={onOutput} />
+      </div>
+      <div className="format-note" aria-label="支持的输入格式">
+        <span className="format-note-label">输入格式</span>
+        <span className="format-note-values">
+          .ibl · .kfb · <strong>.image</strong> · .svs · .tif/.tiff
+        </span>
+        <span className="format-note-auto">自动识别</span>
       </div>
       <div className="action-row">
         <div className="segment">
@@ -701,13 +796,11 @@ function PathButton({ label, value, onClick }: { label: string; value: string; o
 function SettingsView({
   settings,
   conversionSettings,
-  hint,
   onChange,
   onConversionChange,
 }: {
   settings: ThemeSettings;
   conversionSettings: ConversionSettings;
-  hint: string;
   onChange: (settings: ThemeSettings) => void;
   onConversionChange: (settings: ConversionSettings) => void;
 }) {
@@ -715,7 +808,6 @@ function SettingsView({
     <section className="settings-view">
       <div className="settings-head">
         <h2>设置</h2>
-        <p>{hint}</p>
       </div>
       <div className="settings-group">
         <label>外观模式</label>
@@ -741,7 +833,7 @@ function SettingsView({
             label="同时处理 WSI"
             value={conversionSettings.parallel_wsi}
             min={1}
-            max={4}
+            max={8}
             onChange={(value) => onConversionChange({ ...conversionSettings, parallel_wsi: value })}
           />
           <NumberField
@@ -760,15 +852,7 @@ function SettingsView({
             onChange={(value) => onConversionChange({ ...conversionSettings, memory_budget_mb: value })}
           />
         </div>
-        <input
-          className="quality-range"
-          type="range"
-          min={1}
-          max={100}
-          value={conversionSettings.jpeg_quality}
-          onChange={(event) => onConversionChange({ ...conversionSettings, jpeg_quality: Number(event.target.value) })}
-        />
-        <p className="settings-note">并行处理会同时转换多个 WSI，默认 1 最稳妥；内存预算用于转换算法调度，不是操作系统硬限制。</p>
+        <p className="settings-note">并行处理会同时转换多个 WSI，默认 1 最稳妥；内存预算会在并发 WSI 之间分配，不是操作系统硬限制。</p>
       </div>
       <div className="settings-actions">
         <button className="soft" onClick={() => onChange(defaultThemeSettings)}>
@@ -797,6 +881,29 @@ function NumberField({
   step?: number;
   onChange: (value: number) => void;
 }) {
+  const [draft, setDraft] = useState(String(value));
+
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  function parseDraft(raw: string): number | null {
+    if (!raw.trim()) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.round(parsed) : null;
+  }
+
+  function commitDraft(raw: string) {
+    const parsed = parseDraft(raw);
+    if (parsed === null) {
+      setDraft(String(value));
+      return;
+    }
+    const committed = Math.min(max, Math.max(min, parsed));
+    setDraft(String(committed));
+    onChange(committed);
+  }
+
   return (
     <label className="text-field">
       <span>{label}</span>
@@ -805,8 +912,12 @@ function NumberField({
         min={min}
         max={max}
         step={step}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={(event) => commitDraft(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+        }}
       />
     </label>
   );

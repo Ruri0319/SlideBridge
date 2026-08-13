@@ -126,7 +126,7 @@ class ConvertOptions:
         return bool(self.svs_use_bigtiff)
 
     def resolved_parallel_wsi(self) -> int:
-        return max(1, min(4, int(self.parallel_wsi)))
+        return max(1, min(8, int(self.parallel_wsi)))
 
 
 @dataclass

@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-APP_NAME = "IBL2SVS"
-APP_VERSION = os.getenv("IBL2SVS_VERSION", "0.3.0")
-BUILD_REF = os.getenv("IBL2SVS_BUILD_REF", "dev")
+APP_NAME = "SlideBridge"
+APP_VERSION = os.getenv("SLIDEBRIDGE_VERSION", os.getenv("IBL2SVS_VERSION", "0.3.0"))
+BUILD_REF = os.getenv("SLIDEBRIDGE_BUILD_REF", os.getenv("IBL2SVS_BUILD_REF", "dev"))
 BUILD_TIME = os.getenv(
-    "IBL2SVS_BUILD_TIME",
-    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "SLIDEBRIDGE_BUILD_TIME",
+    os.getenv(
+        "IBL2SVS_BUILD_TIME",
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    ),
 )
 
 

@@ -9,13 +9,13 @@ $Desktop = Join-Path $Root "desktop"
 $Tauri = Join-Path $Desktop "src-tauri"
 $Binaries = Join-Path $Tauri "binaries"
 $TargetTriple = "x86_64-pc-windows-msvc"
-$WorkerSource = Join-Path $Root "dist\ibl2svs-worker.exe"
-$WorkerTarget = Join-Path $Binaries "ibl2svs-worker-$TargetTriple.exe"
+$WorkerSource = Join-Path $Root "dist\slidebridge-worker.exe"
+$WorkerTarget = Join-Path $Binaries "slidebridge-worker-$TargetTriple.exe"
 
 Push-Location $Root
 try {
     & $PythonExe -m pip install -r requirements.txt
-    & $PythonExe -m PyInstaller IBL2SVSWorker.spec --clean --noconfirm
+    & $PythonExe -m PyInstaller SlideBridgeWorker.spec --clean --noconfirm
 
     if (!(Test-Path $Binaries)) {
         New-Item -ItemType Directory -Path $Binaries | Out-Null

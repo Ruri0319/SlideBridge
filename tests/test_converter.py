@@ -18,7 +18,7 @@ from ibl2svs.converter import (
 )
 from ibl2svs.models import ConvertOptions, ConvertResult
 from ibl2svs.writer import WriteImageError
-from tests.support import create_sample_ibl, create_sample_kfb
+from tests.support import create_sample_ibl, create_sample_image, create_sample_kfb
 
 
 class ConverterTests(unittest.TestCase):
@@ -43,19 +43,20 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(detect_input_format("a.tif"), "generic_tiff")
         self.assertEqual(detect_input_format("a.tiff"), "generic_tiff")
         self.assertEqual(detect_input_format("a.kfb"), "kfb")
+        self.assertEqual(detect_input_format("a.image"), "image")
         self.assertEqual(detect_input_format("a.txt"), "unsupported")
 
     def test_find_convertible_files_depends_on_output_format(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.txt"]:
+            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.image", "f.txt"]:
                 (root / name).write_text("x")
 
             to_svs = find_convertible_files(root, recursive=False, output_format="svs")
             to_tiff = find_convertible_files(root, recursive=False, output_format="generic_tiff")
 
-            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb"])
-            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb"])
+            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.image"])
+            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.image"])
 
     def test_build_output_path_avoids_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -169,6 +170,32 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(result.mpp, 0.25)
             self.assertTrue(output.exists())
 
+    def test_convert_file_accepts_image_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "sample.image"
+            output = root / "sample.tif"
+            create_sample_image(source)
+
+            def fake_write_image(slide, output_path, options, progress_callback=None, cancel_event=None):
+                self.assertEqual(slide.width, 512)
+                self.assertEqual(slide.height, 512)
+                Path(output_path).write_bytes(b"mock tiff")
+                return 1, {
+                    "backend": "mock",
+                    "level_dimensions": [(slide.width, slide.height)],
+                }
+
+            with mock.patch("ibl2svs.converter.write_image", side_effect=fake_write_image):
+                result = convert_file(source, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.input_format, "image")
+            self.assertEqual(result.width, 512)
+            self.assertEqual(result.height, 512)
+            self.assertAlmostEqual(result.mpp, 0.3466053, places=5)
+            self.assertTrue(output.exists())
+
     def test_convert_folder_parallel_mode_preserves_unique_output_names(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -235,6 +262,40 @@ class ConverterTests(unittest.TestCase):
 
             self.assertEqual(batch.success_count, 3)
             self.assertEqual(max_active, 2)
+
+    def test_convert_folder_parallel_mode_splits_total_memory_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            for name in ["a.ibl", "b.ibl", "c.ibl"]:
+                (input_dir / name).write_text("x")
+
+            task_budgets: list[int] = []
+
+            def fake_convert(input_path, output_path, options, logger=None, progress_callback=None, cancel_event=None):
+                task_budgets.append(options.memory_budget_mb)
+                return ConvertResult(
+                    input_path=Path(input_path),
+                    output_path=Path(output_path),
+                    success=True,
+                    output_format=options.output_format,
+                )
+
+            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert):
+                convert_folder(
+                    input_dir,
+                    output_dir,
+                    ConvertOptions(
+                        output_format="generic_tiff",
+                        parallel_wsi=3,
+                        memory_budget_mb=6144,
+                    ),
+                )
+
+            self.assertEqual(task_budgets, [2048, 2048, 2048])
 
 
 if __name__ == "__main__":

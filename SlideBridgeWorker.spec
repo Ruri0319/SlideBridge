@@ -45,7 +45,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="ibl2svs-worker",
+    name="slidebridge-worker",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

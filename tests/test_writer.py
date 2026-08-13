@@ -8,14 +8,16 @@ from pathlib import Path
 
 from ibl2svs.converter import convert_file
 from ibl2svs.models import ConvertOptions
+from ibl2svs.punuoxi_source import PunuoxiImageSource
 from ibl2svs.tiff_source import TiffSlideSource
 from ibl2svs.writer import (
+    _build_label_array,
     _compute_svs_pyramid_shapes,
     finalize_svs_with_libtiff,
     write_image,
     WriteImageError,
 )
-from tests.support import create_sample_ibl
+from tests.support import create_sample_ibl, create_sample_image
 
 
 TIFFFILE_AVAILABLE = importlib.util.find_spec("tifffile") is not None
@@ -135,6 +137,35 @@ class WriterTests(unittest.TestCase):
                 self.assertAlmostEqual(level_mpp_y, 0.5, places=4)
             with TiffSlideSource(output) as source:
                 self.assertEqual(source.base_info.max_zoom_rate, 40)
+
+    def test_image_conversion_preserves_restored_tile_orientation(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "directional.image"
+            output = root / "directional.tif"
+            create_sample_image(sample, directional_tile=True)
+
+            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success, result.error)
+            with TiffSlideSource(output) as source:
+                tile = source.read_region(0, 0, 256, 256)
+            self.assertAlmostEqual(int(tile[64, 64, 0]), 220, delta=8)
+            self.assertAlmostEqual(int(tile[64, 192, 1]), 210, delta=8)
+            self.assertAlmostEqual(int(tile[192, 64, 2]), 220, delta=8)
+            self.assertAlmostEqual(int(tile[192, 192, 0]), 220, delta=8)
+
+    def test_image_string_scan_time_is_rendered_on_svs_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            sample = Path(tempdir) / "sample.image"
+            create_sample_image(sample)
+
+            with PunuoxiImageSource(sample) as source:
+                with mock.patch("ibl2svs.writer.ImageDraw.Draw") as draw_factory:
+                    _build_label_array(source)
+
+            rendered_text = [call.args[1] for call in draw_factory.return_value.text.call_args_list]
+            self.assertIn("Scanned: 2026-01-01 12:34:56", rendered_text)
 
     def test_generic_tiff_pyramid_progress_keeps_accumulated_overall_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
