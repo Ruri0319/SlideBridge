@@ -12,6 +12,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelConversion,
   chooseDirectory,
+  getApplicationVersion,
   onConversionEvent,
   openFilesystemPath,
   startConversion,
@@ -172,6 +173,7 @@ export default function App() {
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
   const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
+  const [appVersion, setAppVersion] = useState("0.4.0");
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
   const fileProgressByPath = useRef<Map<string, number>>(new Map());
@@ -182,6 +184,10 @@ export default function App() {
   const lastBatchPercent = useRef(0);
   const batchFinished = useRef(false);
   const batchCancelled = useRef(false);
+
+  useEffect(() => {
+    void getApplicationVersion().then(setAppVersion);
+  }, []);
 
   useEffect(() => {
     setActualTheme(themeResolution.theme);
@@ -455,7 +461,7 @@ export default function App() {
           <NavItem active={view === "settings"} icon={<Settings size={16} />} label="设置" onClick={() => setView("settings")} />
         </nav>
         <div className="sidebar-footer">
-          <span>v0.3.0</span>
+          <span>v{appVersion}</span>
           <span>{actualTheme === "light" ? "Light" : "Dark"}</span>
         </div>
       </aside>

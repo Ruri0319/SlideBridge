@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import type { ConversionEvent, ConversionRequest } from "./types";
@@ -17,6 +18,11 @@ export async function chooseDirectory(): Promise<string | null> {
 export async function openFilesystemPath(path: string): Promise<void> {
   if (!path || !isTauri()) return;
   await openPath(path);
+}
+
+export async function getApplicationVersion(): Promise<string> {
+  if (!isTauri()) return "0.4.0";
+  return getVersion();
 }
 
 export async function startConversion(request: ConversionRequest): Promise<void> {

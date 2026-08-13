@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 0.4.0
 
 - 项目正式更名为 **镜渡 SlideBridge**，定位为通用 WSI 格式转换工具。
 - 更新桌面应用、安装包、运行横幅、日志及 GitHub Release 产物品牌。
