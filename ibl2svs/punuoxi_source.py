@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
-import mmap
 from pathlib import Path
 import re
 import struct
@@ -69,14 +68,14 @@ class PunuoxiLevel:
         return self.width, self.height
 
 
-def _unpack_from(fmt: str, data: mmap.mmap | bytes, offset: int):
+def _unpack_from(fmt: str, data: bytes, offset: int):
     size = struct.calcsize(fmt)
     if offset < 0 or offset + size > len(data):
         raise PunuoxiFormatError("IMAGE 文件头或索引被截断")
     return struct.unpack_from(fmt, data, offset)[0]
 
 
-def _decode_header_text(data: mmap.mmap | bytes, offset: int, size: int) -> str:
+def _decode_header_text(data: bytes, offset: int, size: int) -> str:
     if offset < 0 or offset + size > len(data):
         return ""
     raw = bytes(data[offset : offset + size]).split(b"\x00", 1)[0]
@@ -101,7 +100,6 @@ class PunuoxiImageSource:
         self.path = Path(path)
         self.cache_size = max(1, int(cache_size))
         self._fh = self.path.open("rb")
-        self._mmap: mmap.mmap | None = None
         self._lock = threading.RLock()
         self._tile_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._preview_image: Image.Image | None = None
@@ -112,7 +110,6 @@ class PunuoxiImageSource:
             if self._file_size < HEADER_MIN_SIZE + TAIL_SIZE:
                 raise PunuoxiFormatError("IMAGE 文件过小，缺少固定头部或尾部标识")
 
-            self._mmap = mmap.mmap(self._fh.fileno(), length=0, access=mmap.ACCESS_READ)
             self._parse_header()
             self._levels = self._parse_levels()
             if not self._levels:
@@ -132,10 +129,6 @@ class PunuoxiImageSource:
     def close(self) -> None:
         with self._lock:
             self._tile_cache.clear()
-            mapped = getattr(self, "_mmap", None)
-            if mapped is not None:
-                mapped.close()
-                self._mmap = None
             fh = getattr(self, "_fh", None)
             if fh is not None:
                 fh.close()
@@ -163,12 +156,21 @@ class PunuoxiImageSource:
     def tail_identifier(self) -> str:
         return self._tail_identifier
 
-    def _parse_header(self) -> None:
-        data = self._mmap
-        if data is None:
-            raise PunuoxiFormatError("IMAGE 文件未打开")
+    def _read_at(self, offset: int, size: int) -> bytes:
+        with self._lock:
+            fh = self._fh
+            if fh is None:
+                raise PunuoxiFormatError("IMAGE 文件已关闭")
+            fh.seek(offset)
+            data = fh.read(size)
+        if len(data) != size:
+            raise PunuoxiFormatError("IMAGE 文件头、索引或瓦片数据被截断")
+        return data
 
-        tail = bytes(data[self._file_size - TAIL_SIZE : self._file_size])
+    def _parse_header(self) -> None:
+        data = self._read_at(0, HEADER_MIN_SIZE)
+
+        tail = self._read_at(self._file_size - TAIL_SIZE, TAIL_SIZE)
         if not HEX_ID_RE.fullmatch(tail):
             raise PunuoxiFormatError("IMAGE 尾部 32 字节标识无效")
         self._tail_identifier = tail[:-1].decode("ascii").lower()
@@ -199,10 +201,6 @@ class PunuoxiImageSource:
         self._case_no = _decode_header_text(data, CASE_OFFSET, 0x14)
 
     def _parse_levels(self) -> list[PunuoxiLevel]:
-        data = self._mmap
-        if data is None:
-            raise PunuoxiFormatError("IMAGE 文件未打开")
-
         index_end = self._file_size - TAIL_SIZE
         cursor = self._index_offset
         levels: list[PunuoxiLevel] = []
@@ -213,8 +211,9 @@ class PunuoxiImageSource:
             if cursor + LEVEL_HEADER_SIZE > index_end:
                 raise PunuoxiFormatError("IMAGE 金字塔层头被截断")
 
-            columns = int(_unpack_from("<I", data, cursor))
-            rows = int(_unpack_from("<I", data, cursor + 4))
+            level_header = self._read_at(cursor, LEVEL_HEADER_SIZE)
+            columns = int(_unpack_from("<I", level_header, 0))
+            rows = int(_unpack_from("<I", level_header, 4))
             if columns <= 0 or rows <= 0:
                 raise PunuoxiFormatError(f"IMAGE 第 {len(levels)} 层网格尺寸无效")
 
@@ -224,6 +223,7 @@ class PunuoxiImageSource:
             records_end = records_start + records_size
             if records_end > index_end:
                 raise PunuoxiFormatError(f"IMAGE 第 {len(levels)} 层索引被截断")
+            index_data = self._read_at(records_start, records_size)
 
             physical_records: list[PunuoxiTileRecord] = []
             # The vendor stores the index column-major: all rows for column 0,
@@ -233,10 +233,10 @@ class PunuoxiImageSource:
             for column in range(columns):
                 for row in range(rows):
                     physical_index = column * rows + row
-                    offset = records_start + physical_index * INDEX_RECORD_SIZE
-                    jpeg_length = int(_unpack_from("<I", data, offset))
-                    jpeg_offset = int(_unpack_from("<I", data, offset + 4))
-                    reserved = int(_unpack_from("<I", data, offset + 8))
+                    offset = physical_index * INDEX_RECORD_SIZE
+                    jpeg_length = int(_unpack_from("<I", index_data, offset))
+                    jpeg_offset = int(_unpack_from("<I", index_data, offset + 4))
+                    reserved = int(_unpack_from("<I", index_data, offset + 8))
                     if jpeg_length <= 0:
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 长度无效"
@@ -245,11 +245,11 @@ class PunuoxiImageSource:
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 偏移无效"
                         )
-                    if bytes(data[jpeg_offset : jpeg_offset + 3]) != b"\xff\xd8\xff":
+                    if self._read_at(jpeg_offset, 3) != b"\xff\xd8\xff":
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 不是 JPEG"
                         )
-                    if bytes(data[jpeg_offset + jpeg_length - 2 : jpeg_offset + jpeg_length]) != b"\xff\xd9":
+                    if self._read_at(jpeg_offset + jpeg_length - 2, 2) != b"\xff\xd9":
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) JPEG 尾标记无效"
                         )
@@ -330,10 +330,7 @@ class PunuoxiImageSource:
             if cached is not None:
                 self._tile_cache.move_to_end(record.index)
                 return cached
-            data = self._mmap
-            if data is None:
-                raise PunuoxiFormatError("IMAGE 文件已关闭")
-            blob = bytes(data[record.jpeg_offset : record.jpeg_offset + record.jpeg_length])
+        blob = self._read_at(record.jpeg_offset, record.jpeg_length)
 
         try:
             with Image.open(BytesIO(blob)) as image:

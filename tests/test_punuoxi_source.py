@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,6 +12,17 @@ from tests.support import create_sample_image
 
 
 class PunuoxiImageSourceTests(unittest.TestCase):
+    def test_reads_image_without_memory_mapping_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "sample.image"
+            create_sample_image(path)
+
+            with patch("mmap.mmap", side_effect=AssertionError("must not mmap IMAGE files")):
+                with PunuoxiImageSource(path) as source:
+                    region = source.read_region(0, 0, 16, 16)
+
+            self.assertEqual(region.shape, (16, 16, 3))
+
     def test_reads_header_levels_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.image"

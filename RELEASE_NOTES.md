@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.4.3
+
+- 修复 Windows 读取 `.image` 时整文件内存映射可能触发 `STATUS_IN_PAGE_ERROR (0xC0000006)` 并直接终止 worker 的问题，改为按偏移读取文件数据。
+
 ## 0.4.2
 
 - 修复 Windows 本地代码页使 UTF-8 worker 协议中的中文路径被错误解码，导致现有输入目录被报告为无效的问题。
