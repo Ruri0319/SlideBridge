@@ -237,19 +237,23 @@ class PunuoxiImageSource:
                     jpeg_length = int(_unpack_from("<I", index_data, offset))
                     jpeg_offset = int(_unpack_from("<I", index_data, offset + 4))
                     reserved = int(_unpack_from("<I", index_data, offset + 8))
-                    if jpeg_length <= 0:
-                        raise PunuoxiFormatError(
-                            f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 长度无效"
-                        )
                     if jpeg_offset < HEADER_MIN_SIZE or jpeg_offset + jpeg_length > self._index_offset:
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 偏移无效"
                         )
-                    if self._read_at(jpeg_offset, 3) != b"\xff\xd8\xff":
+                    # Real scanner files use zero-length index records for
+                    # blank rows that pad the declared slide canvas.
+                    if (
+                        jpeg_length
+                        and self._read_at(jpeg_offset, 3) != b"\xff\xd8\xff"
+                    ):
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 不是 JPEG"
                         )
-                    if self._read_at(jpeg_offset + jpeg_length - 2, 2) != b"\xff\xd9":
+                    if (
+                        jpeg_length
+                        and self._read_at(jpeg_offset + jpeg_length - 2, 2) != b"\xff\xd9"
+                    ):
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) JPEG 尾标记无效"
                         )
@@ -325,6 +329,13 @@ class PunuoxiImageSource:
         )
 
     def _decode_tile(self, record: PunuoxiTileRecord) -> np.ndarray:
+        if record.jpeg_length == 0:
+            return np.full(
+                (TILE_SIZE, TILE_SIZE, 3),
+                self.base_info.background_color,
+                dtype=np.uint8,
+            )
+
         with self._lock:
             cached = self._tile_cache.get(record.index)
             if cached is not None:

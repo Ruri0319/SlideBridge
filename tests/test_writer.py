@@ -155,6 +155,21 @@ class WriterTests(unittest.TestCase):
             self.assertAlmostEqual(int(tile[192, 64, 2]), 220, delta=8)
             self.assertAlmostEqual(int(tile[192, 192, 0]), 220, delta=8)
 
+    def test_image_conversion_renders_empty_tiles_as_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "sparse.image"
+            output = root / "sparse.tif"
+            create_sample_image(sample, empty_tiles={(0, 0, 1)})
+
+            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success, result.error)
+            with TiffSlideSource(output) as source:
+                blank = source.read_region(0, 256, 64, 64)
+            self.assertEqual(int(blank.min()), 250)
+            self.assertEqual(int(blank.max()), 250)
+
     def test_image_string_scan_time_is_rendered_on_svs_label(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             sample = Path(tempdir) / "sample.image"

@@ -41,7 +41,7 @@ GitHub Release
 推送 v* 标签会触发 .github/workflows/release.yml，自动构建 Windows x64 NSIS 安装包和未签名 macOS DMG，并发布到 GitHub Release。
 
 示例：
-   git tag v0.4.3
+   git tag v0.4.4
    git push origin main --tags
 
 界面使用说明

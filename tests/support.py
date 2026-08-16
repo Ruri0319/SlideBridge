@@ -22,7 +22,12 @@ def jpeg_bytes(color: tuple[int, int, int], size: tuple[int, int], *, quality: i
     return buf.getvalue()
 
 
-def create_sample_image(path: Path, *, directional_tile: bool = False) -> None:
+def create_sample_image(
+    path: Path,
+    *,
+    directional_tile: bool = False,
+    empty_tiles: set[tuple[int, int, int]] | None = None,
+) -> None:
     """Create a small file matching the investigated private .image layout."""
     width = 512
     height = 512
@@ -63,6 +68,9 @@ def create_sample_image(path: Path, *, directional_tile: bool = False) -> None:
         for column in range(columns):
             for row in range(rows):
                 color = colors[row * columns + column]
+                if empty_tiles and (level_index, column, row) in empty_tiles:
+                    entries.append((0, len(payload), 0))
+                    continue
                 if directional_tile and level_index == 0 and column == 0 and row == 0:
                     logical = Image.new("RGB", (tile_size, tile_size), color)
                     logical.paste((220, 30, 40), (0, 0, tile_size // 2, tile_size // 2))

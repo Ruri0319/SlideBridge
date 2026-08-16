@@ -58,6 +58,18 @@ class PunuoxiImageSourceTests(unittest.TestCase):
             np.testing.assert_allclose(region[10, 10], [180, 190, 200], atol=4)
             np.testing.assert_array_equal(outside[:4, :4], 250)
 
+    def test_treats_zero_length_placeholder_tile_as_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "sparse.image"
+            create_sample_image(path, empty_tiles={(0, 0, 1)})
+
+            with PunuoxiImageSource(path) as source:
+                record = source.levels[0].records[2]
+                region = source.read_region(0, 256, 16, 16)
+
+            self.assertEqual((record.column, record.row, record.jpeg_length), (0, 1, 0))
+            np.testing.assert_array_equal(region, 250)
+
     def test_normalizes_column_major_index_to_row_major_coordinates(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.image"
