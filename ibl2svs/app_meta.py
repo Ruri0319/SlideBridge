@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 
 APP_NAME = "SlideBridge"
-APP_VERSION = os.getenv("SLIDEBRIDGE_VERSION", os.getenv("IBL2SVS_VERSION", "0.4.1"))
+APP_VERSION = os.getenv("SLIDEBRIDGE_VERSION", os.getenv("IBL2SVS_VERSION", "0.4.2"))
 BUILD_REF = os.getenv("SLIDEBRIDGE_BUILD_REF", os.getenv("IBL2SVS_BUILD_REF", "dev"))
 BUILD_TIME = os.getenv(
     "SLIDEBRIDGE_BUILD_TIME",

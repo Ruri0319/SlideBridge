@@ -20,6 +20,11 @@ class WorkerProtocolError(ValueError):
     pass
 
 
+def _configure_protocol_stdio() -> None:
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -238,6 +243,7 @@ class BackendWorker:
 
 
 def main() -> int:
+    _configure_protocol_stdio()
     BackendWorker().start()
     return 0
 

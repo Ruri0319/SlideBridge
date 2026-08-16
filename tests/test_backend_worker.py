@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ibl2svs.backend_worker import BackendWorker, options_from_request, serialize_batch, serialize_result
+from ibl2svs.backend_worker import BackendWorker, main, options_from_request, serialize_batch, serialize_result
 from ibl2svs.models import BatchResult, ConvertOptions, ConvertResult
 
 
@@ -92,6 +93,27 @@ class BackendWorkerTests(unittest.TestCase):
         event = json.loads(output.getvalue())
         self.assertEqual(event["type"], "log")
         self.assertEqual(event["message"], "hello")
+
+    def test_main_reads_utf8_windows_paths_from_a_gbk_stream(self) -> None:
+        input_dir = r"F:\C4.STCH\冰冻测试"
+        request = {
+            "type": "start",
+            "payload": {"input_dir": input_dir, "output_dir": r"F:\output"},
+        }
+        stdin_buffer = io.BytesIO((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+        stdout_buffer = io.BytesIO()
+        stdin = io.TextIOWrapper(stdin_buffer, encoding="gbk")
+        stdout = io.TextIOWrapper(stdout_buffer, encoding="gbk")
+
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch.object(sys, "stdout", stdout),
+            mock.patch.object(BackendWorker, "handle_message", autospec=True) as handle_message,
+        ):
+            self.assertEqual(main(), 0)
+
+        self.assertEqual(handle_message.call_args.args[1]["payload"]["input_dir"], input_dir)
+        self.assertEqual(json.loads(stdout_buffer.getvalue().decode("utf-8"))["type"], "ready")
 
     def test_worker_start_job_invokes_convert_folder_and_emits_done(self) -> None:
         output = io.StringIO()

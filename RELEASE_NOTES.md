@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.4.2
+
+- 修复 Windows 本地代码页使 UTF-8 worker 协议中的中文路径被错误解码，导致现有输入目录被报告为无效的问题。
+
 ## 0.4.1
 
 - 修复 Windows 路径传入 Python sidecar 时的 JSON Lines 转义问题，避免转换任务在开始前因 `Invalid \escape` 终止。

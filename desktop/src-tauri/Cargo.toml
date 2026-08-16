@@ -1,6 +1,6 @@
 [package]
 name = "slidebridge-desktop"
-version = "0.4.1"
+version = "0.4.2"
 description = "Universal whole-slide image converter"
 authors = ["SlideBridge"]
 edition = "2021"
