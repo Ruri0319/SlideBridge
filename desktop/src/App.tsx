@@ -173,7 +173,7 @@ export default function App() {
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
   const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
-  const [appVersion, setAppVersion] = useState("0.4.0");
+  const [appVersion, setAppVersion] = useState("0.4.1");
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
   const fileProgressByPath = useRef<Map<string, number>>(new Map());

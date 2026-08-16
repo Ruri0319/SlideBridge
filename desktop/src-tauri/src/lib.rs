@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -61,6 +61,12 @@ impl Serialize for CommandError {
     }
 }
 
+fn encode_worker_message(payload: &Value) -> Result<String, CommandError> {
+    let message =
+        serde_json::to_string(payload).map_err(|error| CommandError::Worker(error.to_string()))?;
+    Ok(format!("{message}\n"))
+}
+
 #[tauri::command]
 fn worker_status(manager: State<'_, ConversionManager>) -> WorkerStatus {
     let guard = manager.worker.lock().expect("worker mutex poisoned");
@@ -80,9 +86,10 @@ fn cancel_conversion(manager: State<'_, ConversionManager>) -> Result<(), Comman
         "type": "cancel",
         "job_id": worker.job_id,
     });
+    let message = encode_worker_message(&payload)?;
     worker
         .child
-        .write(format!("{}\n", payload).as_bytes())
+        .write(message.as_bytes())
         .map_err(|error| CommandError::Worker(error.to_string()))?;
     Ok(())
 }
@@ -127,8 +134,9 @@ async fn start_conversion(
             "parallel_wsi": request.parallel_wsi.unwrap_or(1)
         }
     });
+    let message = encode_worker_message(&start_payload)?;
     child
-        .write(format!("{}\n", start_payload).as_bytes())
+        .write(message.as_bytes())
         .map_err(|error| CommandError::Worker(error.to_string()))?;
 
     {
@@ -204,4 +212,24 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running SlideBridge desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_message_escapes_windows_paths() {
+        let input_dir = r"C:\Users\Alice\Slides";
+        let payload = json!({
+            "type": "start",
+            "payload": { "input_dir": input_dir },
+        });
+
+        let message = encode_worker_message(&payload).expect("serialize worker message");
+        let parsed: Value = serde_json::from_str(&message).expect("parse worker message");
+
+        assert!(message.contains(r#"C:\\Users\\Alice\\Slides"#));
+        assert_eq!(parsed["payload"]["input_dir"], input_dir);
+    }
 }

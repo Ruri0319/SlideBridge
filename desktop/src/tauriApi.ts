@@ -21,7 +21,7 @@ export async function openFilesystemPath(path: string): Promise<void> {
 }
 
 export async function getApplicationVersion(): Promise<string> {
-  if (!isTauri()) return "0.4.0";
+  if (!isTauri()) return "0.4.1";
   return getVersion();
 }
 
