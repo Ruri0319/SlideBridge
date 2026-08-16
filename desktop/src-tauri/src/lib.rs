@@ -148,6 +148,7 @@ async fn start_conversion(
     }
 
     let app_for_events = app.clone();
+    let worker_job_id = request.job_id.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = receiver.recv().await {
             match event {
@@ -158,7 +159,6 @@ async fn start_conversion(
                     }
                     let parsed = serde_json::from_str::<serde_json::Value>(&line)
                         .unwrap_or_else(|_| json!({"type": "error", "message": line}));
-                    let _ = app_for_events.emit("conversion:event", parsed.clone());
                     let event_type = parsed
                         .get("type")
                         .and_then(|value| value.as_str())
@@ -166,11 +166,17 @@ async fn start_conversion(
                     if matches!(event_type, "done" | "error") {
                         if let Some(state) = app_for_events.try_state::<ConversionManager>() {
                             let mut guard = state.worker.lock().expect("worker mutex poisoned");
-                            if let Some(worker) = guard.take() {
-                                let _ = worker.child.kill();
+                            if guard
+                                .as_ref()
+                                .is_some_and(|worker| worker.job_id == worker_job_id)
+                            {
+                                if let Some(worker) = guard.take() {
+                                    let _ = worker.child.kill();
+                                }
                             }
                         }
                     }
+                    let _ = app_for_events.emit("conversion:event", parsed);
                 }
                 CommandEvent::Stderr(bytes) => {
                     let message = String::from_utf8_lossy(&bytes).trim().to_string();
@@ -182,13 +188,22 @@ async fn start_conversion(
                     }
                 }
                 CommandEvent::Terminated(payload) => {
-                    let _ = app_for_events.emit(
-                        "conversion:event",
-                        json!({"type": "worker_terminated", "code": payload.code, "signal": payload.signal}),
-                    );
+                    let mut is_current_worker = false;
                     if let Some(state) = app_for_events.try_state::<ConversionManager>() {
                         let mut guard = state.worker.lock().expect("worker mutex poisoned");
-                        *guard = None;
+                        if guard
+                            .as_ref()
+                            .is_some_and(|worker| worker.job_id == worker_job_id)
+                        {
+                            *guard = None;
+                            is_current_worker = true;
+                        }
+                    }
+                    if is_current_worker {
+                        let _ = app_for_events.emit(
+                            "conversion:event",
+                            json!({"type": "worker_terminated", "code": payload.code, "signal": payload.signal}),
+                        );
                     }
                 }
                 _ => {}

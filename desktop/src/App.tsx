@@ -173,7 +173,7 @@ export default function App() {
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
   const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
-  const [appVersion, setAppVersion] = useState("0.4.4");
+  const [appVersion, setAppVersion] = useState("0.4.5");
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
   const fileProgressByPath = useRef<Map<string, number>>(new Map());
@@ -366,7 +366,17 @@ export default function App() {
       return;
     }
     if (event.type === "worker_terminated") {
+      batchFinished.current = true;
+      batchCancelled.current = false;
+      setProgress((state) => ({
+        ...state,
+        running: false,
+        statusText: "Error",
+        currentPhase: "异常中止",
+        etaText: "—",
+      }));
       appendLog(`Worker terminated: ${event.code ?? "-"} ${event.signal ?? ""}`);
+      return;
     }
   }
 
@@ -422,6 +432,18 @@ export default function App() {
   async function cancelCurrent() {
     await cancelConversion();
     appendLog("已请求取消，等待当前写入步骤安全结束");
+  }
+
+  function resetTask() {
+    if (progress.running) return;
+    resetBatchAggregation();
+    setLogs([]);
+    setTaskSettings(null);
+    setProgress({
+      ...initialProgress,
+      currentFile: inputDir ? basename(inputDir) : initialProgress.currentFile,
+      outputDir,
+    });
   }
 
   function updateTheme(next: ThemeSettings) {
@@ -532,6 +554,7 @@ export default function App() {
             onRecursive={setRecursive}
             onStart={runConversion}
             onCancel={cancelCurrent}
+            onReset={resetTask}
             onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
             onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
           />
@@ -657,6 +680,7 @@ function TaskComposer({
   onRecursive,
   onStart,
   onCancel,
+  onReset,
   onOpenOutput,
   onOpenReport,
 }: {
@@ -674,6 +698,7 @@ function TaskComposer({
   onRecursive: (value: boolean) => void;
   onStart: () => void;
   onCancel: () => void;
+  onReset: () => void;
   onOpenOutput: () => void;
   onOpenReport: () => void;
 }) {
@@ -710,6 +735,10 @@ function TaskComposer({
         <button className="soft" disabled={!running} onClick={onCancel}>
           <Square size={14} />
           取消
+        </button>
+        <button className="soft" disabled={running} onClick={onReset}>
+          <RotateCcw size={14} />
+          重置任务
         </button>
         <button className="ghost" disabled={!outputDir} onClick={onOpenOutput}>
           打开输出
