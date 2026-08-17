@@ -3,7 +3,7 @@
 
 用途
 ----
-选择一个包含 .ibl / .kfb / .kfbf / .image / .svs / .tif / .tiff 文件的输入文件夹，再选择输出文件夹，程序会批量转换为带金字塔层级的 Aperio SVS 或 Generic TIFF 文件。
+选择一个包含 .ibl / .kfb / .kfbl / .kfbf / .kfba / .kfbx / .image / .svs / .tif / .tiff 文件的输入文件夹，再选择输出文件夹，程序会批量转换为带金字塔层级的 Aperio SVS 或 Generic TIFF 文件。
 
 架构
 ----
@@ -62,8 +62,8 @@ GitHub Release
 
 WSI TIFF/SVS 互转
 -----------------
-- 输出 SVS 时读取 .ibl / .kfb / .kfbf / .image / .tif / .tiff。
-- 输出 Generic TIFF 时读取 .ibl / .kfb / .kfbf / .image / .svs。
+- 输出 SVS 时读取 .ibl / .kfb / .kfbl / .kfbf / .kfba / .kfbx / .image / .tif / .tiff。
+- 输出 Generic TIFF 时读取 .ibl / .kfb / .kfbl / .kfbf / .kfba / .kfbx / .image / .svs。
 - TIFF/SVS 输入采用保守重封装：重新生成金字塔，不迁移标注或完整私有 metadata。
 
 注意事项

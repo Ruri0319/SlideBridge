@@ -4,6 +4,7 @@ import io
 import sqlite3
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 from PIL import Image
@@ -127,8 +128,15 @@ def _kfb_image_record(image_type: int, blob: bytes, width: int, height: int) -> 
     return bytes(record) + blob
 
 
-def _kfb_tile_record(spec: dict, tile_index_offset: int, *, indirect: bool = False) -> bytes:
-    record = bytearray(64)
+def _kfb_tile_record(
+    spec: dict,
+    tile_index_offset: int,
+    *,
+    indirect: bool = False,
+    version: float = 1.1,
+) -> bytes:
+    record_size = 68 if version == 1.0 else 64
+    record = bytearray(record_size)
     record[0:4] = b"\xf1\x04\xee\xee"
     struct.pack_into("<i", record, 4, spec["x"])
     struct.pack_into("<i", record, 8, spec["y"])
@@ -136,19 +144,28 @@ def _kfb_tile_record(spec: dict, tile_index_offset: int, *, indirect: bool = Fal
     struct.pack_into("<i", record, 16, spec["height"])
     struct.pack_into("<f", record, 20, spec["scale"])
     struct.pack_into("<i", record, 32, len(spec["blob"]))
-    if indirect:
+    if indirect and version >= 2.1:
+        struct.pack_into("<Q", record, 36, spec["offset_ref"])
+        struct.pack_into("<Q", record, 44, spec["size_ref"])
+        struct.pack_into("<Q", record, 52, 0)
+    elif version >= 2.1:
+        struct.pack_into("<Q", record, 36, spec["offset"])
+        struct.pack_into("<Q", record, 44, len(spec["blob"]))
+        struct.pack_into("<Q", record, 52, 0)
+    elif indirect:
         struct.pack_into("<I", record, 36, spec["offset_ref"])
+        struct.pack_into("<I", record, 44, spec["size_ref"])
     else:
         struct.pack_into("<i", record, 36, spec["offset"] - tile_index_offset)
-    struct.pack_into("<i", record, 40, -1)
-    if indirect:
-        struct.pack_into("<I", record, 44, spec["size_ref"])
+    if version < 2.1:
+        struct.pack_into("<i", record, 40, -1)
+    if indirect and version < 2.1:
         for offset in (48, 52, 56):
             struct.pack_into("<i", record, offset, 0)
-    else:
+    elif not indirect and version < 2.1:
         for offset in (44, 48, 52, 56):
             struct.pack_into("<i", record, offset, 20)
-    record[60:64] = b"\xff\x04\xee\xee"
+    record[-4:] = b"\xff\x04\xee\xee"
     return bytes(record)
 
 
@@ -157,9 +174,14 @@ def create_sample_kfb(
     *,
     include_preview_level: bool = True,
     variant: str = "kfb",
+    version: float | None = None,
+    header_marker: bytes = b"\xf1\x01\xee\xee",
+    compressed_index: bool = False,
 ) -> None:
-    if variant not in {"kfb", "kfbf"}:
+    if variant not in {"kfb", "kfbl", "kfbf"}:
         raise ValueError(f"unsupported KFB fixture variant: {variant}")
+    if header_marker not in {b"\xf1\x01\xee\xee", b"\xf1\x02\xee\xee"}:
+        raise ValueError("unsupported KFB header marker")
     width = 24
     height = 18
     tile_size = 16
@@ -193,6 +215,7 @@ def create_sample_kfb(
         current_offset += len(blob)
 
     indirect = variant == "kfbf"
+    version = float(version if version is not None else (2.1 if indirect else 1.1))
     pointer_tables = bytearray()
     if indirect:
         offset_ref_start = current_offset
@@ -205,17 +228,22 @@ def create_sample_kfb(
             pointer_tables.extend(struct.pack("<Q", len(spec["blob"])))
 
     tile_index_offset = current_offset + len(pointer_tables)
-    tile_index = b"".join(
-        _kfb_tile_record(spec, tile_index_offset, indirect=indirect)
+    raw_tile_index = b"".join(
+        _kfb_tile_record(spec, tile_index_offset, indirect=indirect, version=version)
         for spec in tile_specs
     )
+    if compressed_index:
+        compressed = zlib.compress(raw_tile_index)
+        tile_index = b"\xf1\x04\xee\xee" + struct.pack("<II", len(compressed), len(raw_tile_index)) + compressed
+    else:
+        tile_index = raw_tile_index
     last_image_offset = tile_index_offset + len(tile_index)
     thumb_record = _kfb_image_record(2, thumb_blob, 12, 9)
 
     header = bytearray(header_size)
-    header[0:4] = b"\xf1\x01\xee\xee"
-    header[4:8] = b"KFBF" if indirect else b"KFB\x00"
-    struct.pack_into("<f", header, 0x0C, 1.0)
+    header[0:4] = header_marker
+    header[4:8] = {"kfb": b"KFB\x00", "kfbl": b"KFBL", "kfbf": b"KFBF"}[variant]
+    struct.pack_into("<f", header, 0x0C, version)
     struct.pack_into("<I", header, 0x10, len(tile_specs))
     struct.pack_into("<I", header, 0x14, height)
     struct.pack_into("<I", header, 0x18, width)
@@ -246,6 +274,206 @@ def create_sample_kfb(
         + tile_index
         + thumb_record
     )
+
+
+def _kfba_data_block(values: dict[int, int]) -> bytes:
+    block = bytearray(424)
+    struct.pack_into("<Q", block, 0, len(values))
+    for index, (item_id, value) in enumerate(values.items()):
+        struct.pack_into("<IIIQ", block, 8 + index * 20, item_id, 0, 8, value)
+    return bytes(block)
+
+
+def _gray_jpeg_bytes(value: int, size: tuple[int, int]) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("L", size, value).save(buffer, format="JPEG", quality=100, subsampling=0)
+    return buffer.getvalue()
+
+
+def create_sample_kfba(path: Path, *, omit_item_id: int | None = None) -> None:
+    width, height, tile_size = 24, 18, 16
+    field_count, channel_count = 2, 2
+    header_size = 512
+
+    macro_blob = jpeg_bytes((230, 230, 230), (64, 24), quality=100)
+    label_blob = jpeg_bytes((40, 50, 60), (32, 40), quality=100)
+    thumb_blob = jpeg_bytes((90, 100, 110), (12, 9), quality=100)
+    macro_record = _kfb_image_record(2, macro_blob, 64, 24)
+    label_record = _kfb_image_record(3, label_blob, 32, 40)
+    thumb_record = _kfb_image_record(2, thumb_blob, 12, 9)
+
+    block_specs: list[dict[str, object]] = []
+    for field_index in range(field_count):
+        for level_index, level_width, level_height, tiles in (
+            (
+                0,
+                width,
+                height,
+                ((0, 0, 16, 16), (16, 0, 8, 16), (0, 16, 16, 2), (16, 16, 8, 2)),
+            ),
+            (1, 12, 9, ((0, 0, 12, 9),)),
+        ):
+            del level_width, level_height
+            for x, y, tile_width, tile_height in tiles:
+                channel_values = (
+                    30 + field_index * 40 + level_index * 10,
+                    120 + field_index * 40 + level_index * 10,
+                )
+                block_specs.append(
+                    {
+                        "field": field_index,
+                        "level": level_index,
+                        "x": x,
+                        "y": y,
+                        "width": tile_width,
+                        "height": tile_height,
+                        "blobs": [
+                            _gray_jpeg_bytes(value, (tile_width, tile_height))
+                            for value in channel_values
+                        ],
+                    }
+                )
+
+    header = bytearray(header_size)
+    header[0:4] = b"\xf1\x01\xee\xee"
+    header[4:12] = b"KFBA\x00\x00\x00\x00"
+    struct.pack_into("<f", header, 0x0C, 1.4)
+    struct.pack_into("<I", header, 0x10, len(block_specs))
+    struct.pack_into("<I", header, 0x14, height)
+    struct.pack_into("<I", header, 0x18, width)
+    struct.pack_into("<I", header, 0x1C, 40)
+    header[0x20:0x24] = b"JPEG"
+    struct.pack_into("<I", header, 0x2C, 1_700_000_000)
+    struct.pack_into("<f", header, 0x4C, 0.25)
+    struct.pack_into("<I", header, 0x58, tile_size)
+
+    header_items = [
+        (75, struct.pack("<I", channel_count)),
+        (76, b"1\x00".ljust(20, b"\x00") + b"2\x00".ljust(20, b"\x00")),
+        (77, b"Red\x00".ljust(40, b"\x00") + b"Green\x00".ljust(40, b"\x00")),
+        (78, struct.pack("<ii", 1, 2)),
+        (79, struct.pack("<iiiiii", 255, 0, 0, 0, 255, 0)),
+        (84, struct.pack("<dd", 1.5, 2.5)),
+    ]
+    metadata = bytearray(b"\xff\x01\xee\xee" + struct.pack("<I", len(header_items)))
+    for item_id, blob in header_items:
+        metadata.extend(struct.pack("<II", item_id, len(blob)))
+        metadata.extend(blob)
+    header[0x5C : 0x5C + len(metadata)] = metadata
+
+    payload = bytearray(header)
+    first_image_offset = len(payload)
+    payload.extend(macro_record)
+    second_image_offset = len(payload)
+    payload.extend(label_record)
+    last_image_offset = len(payload)
+    payload.extend(thumb_record)
+
+    for spec in block_specs:
+        offsets: list[int] = []
+        lengths: list[int] = []
+        for blob in spec["blobs"]:
+            offsets.append(len(payload))
+            lengths.append(len(blob))
+            payload.extend(blob)
+        spec["offsets"] = offsets
+        spec["lengths"] = lengths
+
+    for spec in block_specs:
+        spec["offset_table"] = len(payload)
+        payload.extend(struct.pack("<QQ", *spec["offsets"]))
+        spec["length_table"] = len(payload)
+        payload.extend(struct.pack("<QQ", *spec["lengths"]))
+
+    tile_index_offset = len(payload)
+    for block_number, spec in enumerate(block_specs):
+        values = {
+            0: int(spec["x"]),
+            1: int(spec["y"]),
+            2: int(spec["height"]),
+            3: int(spec["width"]),
+            4: int(spec["offset_table"]),
+            5: int(spec["length_table"]),
+            6: int(spec["field"]),
+            7: int(spec["level"]),
+            10: block_number,
+        }
+        if omit_item_id is not None:
+            values.pop(omit_item_id, None)
+        payload.extend(_kfba_data_block(values))
+
+    struct.pack_into("<I", payload, 0x34, first_image_offset)
+    struct.pack_into("<I", payload, 0x38, second_image_offset)
+    struct.pack_into("<Q", payload, 0x3C, last_image_offset)
+    struct.pack_into("<Q", payload, 0x44, tile_index_offset)
+    path.write_bytes(payload)
+
+
+def _kfbx_attribute(attribute_id: int, value_type: int, values) -> bytes:
+    if value_type == 0:
+        payload = bytes(values)
+        count = len(payload)
+    else:
+        format_char = {1: "B", 2: "i", 3: "Q", 4: "f"}[value_type]
+        sequence = tuple(values)
+        payload = struct.pack(f"<{len(sequence)}{format_char}", *sequence)
+        count = len(sequence)
+    return struct.pack("<HHI", attribute_id, value_type, count) + payload
+
+
+def create_sample_kfbx(path: Path) -> None:
+    width, height, tile_size = 24, 18, 16
+    level_specs = [
+        (
+            40.0,
+            width,
+            height,
+            [
+                (0, 0, 16, 16, (20, 30, 40)),
+                (16, 0, 8, 16, (80, 90, 100)),
+                (0, 16, 16, 2, (140, 150, 160)),
+                (16, 16, 8, 2, (200, 210, 220)),
+            ],
+        ),
+        (20.0, 12, 9, [(0, 0, 12, 9, (120, 130, 140))]),
+    ]
+
+    header = bytearray(76)
+    header[:4] = b"KAC\x00"
+    payload = bytearray(header)
+    encoded_levels: list[tuple[float, int, int, list[int], list[int], list[int]]] = []
+    for magnification, level_width, level_height, tiles in level_specs:
+        offsets: list[int] = []
+        lengths: list[int] = []
+        coordinates: list[int] = []
+        for x, y, tile_width, tile_height, color in tiles:
+            blob = jpeg_bytes(color, (tile_width, tile_height), quality=100)
+            offsets.append(len(payload))
+            lengths.append(len(blob))
+            coordinates.extend((x, y))
+            payload.extend(blob)
+        encoded_levels.append(
+            (magnification, level_width, level_height, offsets, lengths, coordinates)
+        )
+
+    first_attribute_offset = len(payload)
+    attributes = bytearray()
+    attributes.extend(_kfbx_attribute(1, 2, [tile_size]))
+    attributes.extend(_kfbx_attribute(2, 2, [tile_size]))
+    attributes.extend(_kfbx_attribute(2123, 2, [1]))
+    for magnification, level_width, level_height, offsets, lengths, coordinates in encoded_levels:
+        nested = bytearray()
+        nested.extend(_kfbx_attribute(3, 2, [level_width]))
+        nested.extend(_kfbx_attribute(4, 2, [level_height]))
+        nested.extend(_kfbx_attribute(5, 4, [magnification]))
+        nested.extend(_kfbx_attribute(123, 3, offsets))
+        nested.extend(_kfbx_attribute(135, 2, lengths))
+        nested.extend(_kfbx_attribute(134, 2, coordinates))
+        attributes.extend(_kfbx_attribute(123, 0, nested))
+
+    struct.pack_into("<Q", payload, 68, first_attribute_offset)
+    payload.extend(attributes)
+    path.write_bytes(payload)
 
 
 def create_sample_ibl(

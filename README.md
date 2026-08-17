@@ -2,7 +2,7 @@
 
 [![Release](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml)
 
-**镜渡 SlideBridge** 是一个通用病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb/.kfbf`、`.image`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
+**镜渡 SlideBridge** 是一个通用病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb/.kfbl/.kfbf/.kfba/.kfbx`、`.image`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
 
 项目包含两层入口：
 
@@ -31,12 +31,12 @@ open /Applications/SlideBridge.app
 | 输入 | 输出 Generic TIFF | 输出 SVS | 说明 |
 |----|----|----|----|
 | `.ibl` | 支持 | 支持 | 读取厂商 IBL SQLite/tile 数据 |
-| `.kfb/.kfbf` | 支持 | 支持 | 支持普通 KFB 和 KFBF JPEG tile 结构 |
+| `.kfb/.kfbl/.kfbf/.kfba/.kfbx` | 支持 | 支持 | 按内容签名识别；仅 KFBF 2.1 RGB/JPEG 有真实样本验证 |
 | `.image` | 支持 | 支持 | 读取已验证的私有 JPEG 瓦片金字塔结构 |
 | `.svs` | 支持 | 不适用 | SVS 转 Generic Pyramidal TIFF |
 | `.tif/.tiff` | 不适用 | 支持 | Generic TIFF 转 Aperio-compatible SVS |
 
-KFB 支持采用保守重封装路径：`decode -> rebuild pyramid -> re-encode`。当前不会迁移标注或完整厂商私有 metadata；遇到新的 KFB 变体时可能需要补充解析逻辑，欢迎提交修改意见。
+KFB 家族会按容器签名和版本读取原生金字塔。Generic TIFF 对可直通的 JPEG tile 保留原始压缩数据；多字段、多通道或高位深数据会同时写出可阅片 RGB 金字塔和 OME 原始 series。SVS 保持 Aperio 布局，并明确报告未保存的额外原始平面。除 KFBF 2.1 RGB/JPEG 外，其余 KFB 路径会标记为 `static_unverified`；未知布局会明确失败，不会套用旧偏移继续转换。
 
 `.image` 支持会优先保留厂家原生资源：解析 64 位资源偏移和 8 级列优先索引，Generic TIFF 直接写出原生金字塔层，SVS 从最接近的厂家层生成兼容页面；thumbnail、macro、label 以原始尺寸写出。主层 JPEG 需要轴转置，若运行环境提供 `jpegtran`（或将其路径放入 `IBL2SVS_JPEGTRAN`），会使用 DCT 域无损转置，否则回退到高质量重编码并在转换结果中标记。机构、病例号、设备号和扫描时间会作为扫描 metadata 读取，但不会原样写回厂商私有结构。
 

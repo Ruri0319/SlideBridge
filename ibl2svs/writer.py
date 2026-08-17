@@ -50,12 +50,19 @@ def _load_tiff_runtime(*, require_imagecodecs: bool = True):
     return tifffile
 
 
-def _is_native_punuoxi(slide) -> bool:
+def _is_native_source(slide) -> bool:
     return bool(
         getattr(slide, "supports_native_pyramid", False)
         and callable(getattr(slide, "iter_native_level_jpegs", None))
         and callable(getattr(slide, "read_level_region", None))
     )
+
+
+def _native_output_ready(slide) -> bool:
+    ready = getattr(slide, "native_output_ready", None)
+    if ready is not None:
+        return _is_native_source(slide) and bool(ready)
+    return _is_native_source(slide) and getattr(slide, "native_resource_status", "") == "native"
 
 
 def _mpp_xy(slide) -> tuple[float, float]:
@@ -508,7 +515,7 @@ def _native_level_source_for_shape(slide, width: int, height: int):
 
 
 def _native_resource_image(slide, name: str) -> Image.Image | None:
-    if not _is_native_punuoxi(slide) or getattr(slide, "native_resource_status", "") != "native":
+    if not _is_native_source(slide) or getattr(slide, "native_resource_status", "") != "native":
         return None
     getter = getattr(slide, f"get_{name}_image", None)
     if not callable(getter):
@@ -516,26 +523,160 @@ def _native_resource_image(slide, name: str) -> Image.Image | None:
     return getter()
 
 
-def _write_native_rgb_page(
+def _write_native_page(
     tif,
     image: Image.Image,
     *,
-    description: str,
+    description: str | None,
     subfiletype: int,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
-    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if image.mode in {"1", "L"}:
+        array = np.asarray(image, dtype=np.uint8)
+        photometric = "minisblack"
+    elif image.mode.startswith("I;16"):
+        array = np.asarray(image, dtype=np.uint16)
+        photometric = "minisblack"
+    else:
+        array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        photometric = "rgb"
     height, width = array.shape[:2]
     tif.write(
         array,
-        photometric="rgb",
+        photometric=photometric,
         compression="lzw",
         rowsperstrip=max(1, min(height, 64)),
         description=description,
-        metadata=None,
+        metadata=metadata,
         software="",
         subfiletype=subfiletype,
     )
     return width, height
+
+
+def _source_requires_raw_ome(slide) -> bool:
+    return bool(getattr(slide, "requires_raw_ome", False))
+
+
+def _svs_omitted_native_data(slide) -> str | None:
+    if not _source_requires_raw_ome(slide):
+        return None
+    fields = tuple(getattr(slide, "native_fields", (0,)))
+    return (
+        f"fields={len(fields)}, C={int(getattr(slide, 'source_channel_count', 1))}, "
+        f"Z={int(getattr(slide, 'native_z_count', 1))}, "
+        f"T={int(getattr(slide, 'native_t_count', 1))}, "
+        f"bit_depth={int(getattr(slide, 'source_bit_depth', 8))}; "
+        f"仅保存 field={int(getattr(slide, 'default_field_index', 0))} 的 RGB 合成观感"
+    )
+
+
+def _ome_channel_color(color: tuple[int, int, int]) -> int:
+    rgba = (
+        (int(color[0]) << 24)
+        | (int(color[1]) << 16)
+        | (int(color[2]) << 8)
+        | 255
+    )
+    return rgba - (1 << 32) if rgba >= (1 << 31) else rgba
+
+
+def _write_native_raw_ome_series(
+    tif,
+    slide,
+    *,
+    tile_size: int,
+    mpp_x: float,
+    mpp_y: float,
+    cancel_event=None,
+) -> int:
+    fields = tuple(getattr(slide, "native_fields", (0,)))
+    z_count = int(getattr(slide, "native_z_count", 1))
+    t_count = int(getattr(slide, "native_t_count", 1))
+    native_channel_count = int(getattr(slide, "native_channel_count", 1))
+    source_channel_count = int(getattr(slide, "source_channel_count", native_channel_count))
+    channel_count = native_channel_count if native_channel_count > 1 else source_channel_count
+    bit_depth = int(getattr(slide, "source_bit_depth", 8))
+    dtype = np.uint16 if bit_depth > 8 else np.uint8
+    width, height = slide.level_dimensions[0]
+    columns = (width + tile_size - 1) // tile_size
+    rows = (height + tile_size - 1) // tile_size
+    channel_metadata = list(getattr(slide, "channel_metadata", []))
+    if len(channel_metadata) != channel_count:
+        channel_metadata = [
+            {"name": f"Channel {index + 1}", "color": (255, 255, 255), "exposure": 0.0}
+            for index in range(channel_count)
+        ]
+
+    plane_count = t_count * z_count * channel_count
+    resolution = _resolution_kwargs_for_mpp(
+        slide.base_info.mpp,
+        mpp_x=mpp_x,
+        mpp_y=mpp_y,
+        base_width=slide.width,
+        base_height=slide.height,
+        level_width=width,
+        level_height=height,
+    )
+    for field_index in fields:
+        def raw_tiles(field_index=field_index):
+            for t_index in range(t_count):
+                for z_index in range(z_count):
+                    for channel_index in range(channel_count):
+                        for row in range(rows):
+                            for column in range(columns):
+                                if cancel_event is not None and cancel_event.is_set():
+                                    raise RuntimeError("转换已取消")
+                                yield slide.read_level_field_plane_region(
+                                    0,
+                                    field_index,
+                                    channel_index,
+                                    z_index,
+                                    t_index,
+                                    column * tile_size,
+                                    row * tile_size,
+                                    min(tile_size, width - column * tile_size),
+                                    min(tile_size, height - row * tile_size),
+                                )
+
+        exposures = [
+            float(channel_metadata[channel_index].get("exposure", 0.0))
+            for _t_index in range(t_count)
+            for _z_index in range(z_count)
+            for channel_index in range(channel_count)
+        ]
+        metadata = {
+            "axes": "TZCYX",
+            "Name": f"{slide.path.stem} field {field_index} raw",
+            "SignificantBits": bit_depth,
+            "PhysicalSizeX": mpp_x,
+            "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeY": mpp_y,
+            "PhysicalSizeYUnit": "µm",
+            "Channel": {
+                "Name": [str(item.get("name", f"Channel {index + 1}")) for index, item in enumerate(channel_metadata)],
+                "Color": [
+                    _ome_channel_color(tuple(item.get("color", (255, 255, 255))))
+                    for item in channel_metadata
+                ],
+            },
+            "Plane": {
+                "ExposureTime": exposures,
+            },
+        }
+        tif.write(
+            data=raw_tiles(),
+            shape=(t_count, z_count, channel_count, height, width),
+            dtype=dtype,
+            photometric="minisblack",
+            tile=(tile_size, tile_size),
+            compression="deflate",
+            predictor=True,
+            metadata=metadata,
+            software=f"{APP_NAME} {APP_VERSION}",
+            **resolution,
+        )
+    return len(fields) * plane_count * columns * rows
 
 
 def _write_generic_native_tiff(
@@ -547,68 +688,146 @@ def _write_generic_native_tiff(
     progress_callback=None,
     cancel_event=None,
 ) -> int:
-    """Write the vendor's native IMAGE levels without resampling."""
+    """Write a vendor-native JPEG pyramid without resampling."""
 
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
-    tile_size = 256
+    tile_size = int(getattr(slide, "tile_size", 256))
     levels = list(slide.levels)
     mpp_x, mpp_y = _mpp_xy(slide)
+    requires_raw_ome = _source_requires_raw_ome(slide)
     resource_status = getattr(slide, "native_resource_status", "unavailable")
-    aux_names = ("thumbnail", "macro", "label") if resource_status == "native" else ()
-    total_tiles = sum(len(level.records) for level in levels)
-    overall_total = 1 + total_tiles + len(aux_names) + 1
+    resource_dimensions = dict(getattr(slide, "native_resource_dimensions", {}))
+    aux_names = tuple(
+        name for name in ("thumbnail", "macro", "label")
+        if resource_status == "native" and resource_dimensions.get(name) is not None
+    )
+    display_tiles = sum(level.columns * level.rows for level in levels)
+    raw_tiles = 0
+    if requires_raw_ome:
+        raw_channel_count = (
+            int(getattr(slide, "native_channel_count", 1))
+            if int(getattr(slide, "native_channel_count", 1)) > 1
+            else int(getattr(slide, "source_channel_count", 1))
+        )
+        main_level = levels[0]
+        raw_tiles = (
+            len(tuple(getattr(slide, "native_fields", (0,))))
+            * int(getattr(slide, "native_z_count", 1))
+            * int(getattr(slide, "native_t_count", 1))
+            * raw_channel_count
+            * main_level.columns
+            * main_level.rows
+        )
+    overall_total = 1 + display_tiles + raw_tiles + len(aux_names) + 1
     overall_done = 1
-    perf["current_stage"] = "解析 IMAGE"
+    source_name = str(getattr(slide, "source_container", "IMAGE")).upper()
+    perf["current_stage"] = f"解析 {source_name}"
     perf["native_path"] = True
     perf["native_level_dimensions"] = list(slide.level_dimensions)
     perf["native_resource_dimensions"] = dict(getattr(slide, "native_resource_dimensions", {}))
     perf["native_fallback_reason"] = getattr(slide, "native_resource_reason", "") or None
-    _emit_progress(progress_callback, "解析 IMAGE", 1, 1, overall_done, overall_total)
+    _emit_progress(progress_callback, f"解析 {source_name}", 1, 1, overall_done, overall_total)
 
-    blank_tile = _encode_jpeg(
-        np.full((tile_size, tile_size, 3), slide.base_info.background_color, dtype=np.uint8),
-        100,
-    )
+    source_channels = int(getattr(slide, "source_channel_count", 3))
+    encoded_passthrough = not hasattr(slide, "source_codec") or getattr(slide, "native_tile_mode", "") == "jpeg_passthrough"
+    if source_channels == 1:
+        from imagecodecs import jpeg8_encode
 
-    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tif:
+        blank_tile = jpeg8_encode(
+            np.full((tile_size, tile_size), slide.base_info.background_color, dtype=np.uint8),
+            level=100,
+        )
+        page_shape_suffix: tuple[int, ...] = ()
+        page_photometric = "minisblack"
+    else:
+        blank_tile = _encode_jpeg(
+            np.full((tile_size, tile_size, 3), slide.base_info.background_color, dtype=np.uint8),
+            100,
+        )
+        page_shape_suffix = (3,)
+        page_photometric = "rgb"
+
+    with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=requires_raw_ome) as tif:
         for level_index, level in enumerate(levels):
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("转换已取消")
 
-            def encoded_tiles(level_index=level_index):
-                for tile in slide.iter_native_level_jpegs(level_index):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("转换已取消")
-                    yield blank_tile if tile is None else tile
-
             width, height = level.dimensions
-            tif.write(
-                data=encoded_tiles(),
-                shape=(height, width, 3),
-                dtype=np.uint8,
-                photometric="rgb",
-                tile=(tile_size, tile_size),
-                compression="jpeg",
-                subsampling=(1, 1),
-                metadata=None,
-                software=f"{APP_NAME} {APP_VERSION}",
-                description=(
-                    build_generic_description(slide)
-                    if level_index == 0
-                    else f"{APP_NAME} native IMAGE level {level_index} | {width}x{height}"
-                ),
-                subfiletype=0 if level_index == 0 else 1,
-                **_resolution_kwargs_for_mpp(
-                    slide.base_info.mpp,
-                    mpp_x=mpp_x,
-                    mpp_y=mpp_y,
-                    base_width=slide.width,
-                    base_height=slide.height,
-                    level_width=width,
-                    level_height=height,
-                ),
+            description = (
+                build_generic_description(slide)
+                if level_index == 0
+                else f"{APP_NAME} native {source_name} level {level_index} | {width}x{height}"
             )
-            overall_done += len(level.records)
+            page_metadata = None
+            page_subifds = None
+            if requires_raw_ome:
+                description = None
+                if level_index == 0:
+                    page_subifds = len(levels) - 1
+                    page_metadata = {
+                        "axes": "YXS",
+                        "Name": f"{slide.path.stem} RGB",
+                        "PhysicalSizeX": mpp_x,
+                        "PhysicalSizeXUnit": "µm",
+                        "PhysicalSizeY": mpp_y,
+                        "PhysicalSizeYUnit": "µm",
+                        "Description": build_generic_description(slide),
+                    }
+            resolution = _resolution_kwargs_for_mpp(
+                slide.base_info.mpp,
+                mpp_x=mpp_x,
+                mpp_y=mpp_y,
+                base_width=slide.width,
+                base_height=slide.height,
+                level_width=width,
+                level_height=height,
+            )
+            if encoded_passthrough:
+                def encoded_tiles(level_index=level_index):
+                    for tile in slide.iter_native_level_jpegs(level_index):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("转换已取消")
+                        yield blank_tile if tile is None else tile
+
+                tif.write(
+                    data=encoded_tiles(),
+                    shape=(height, width, *page_shape_suffix),
+                    dtype=np.uint8,
+                    photometric=page_photometric,
+                    tile=(tile_size, tile_size),
+                    compression="jpeg",
+                    subsampling=(1, 1),
+                    metadata=page_metadata,
+                    software=f"{APP_NAME} {APP_VERSION}",
+                    description=description,
+                    subfiletype=0 if level_index == 0 else 1,
+                    subifds=page_subifds,
+                    **resolution,
+                )
+            else:
+                source = NativeLevelSource(slide, level_index)
+                decoded_tiles = iter_source_tiles(
+                    source,
+                    tile_size,
+                    chunk_size=max(tile_size, options.resolved_chunk_size()),
+                    cancel_event=cancel_event,
+                )
+                tif.write(
+                    data=decoded_tiles,
+                    shape=(height, width, 3),
+                    dtype=np.uint8,
+                    photometric="rgb",
+                    tile=(tile_size, tile_size),
+                    compression="deflate",
+                    predictor=True,
+                    metadata=page_metadata,
+                    software=f"{APP_NAME} {APP_VERSION}",
+                    description=description,
+                    subfiletype=0 if level_index == 0 else 1,
+                    subifds=page_subifds,
+                    **resolution,
+                )
+            overall_done += level.columns * level.rows
             _emit_progress(
                 progress_callback,
                 "写出原生层",
@@ -624,11 +843,14 @@ def _write_generic_native_tiff(
                 if image is None:
                     continue
                 width, height = image.size
-                _write_native_rgb_page(
+                _write_native_page(
                     tif,
                     image,
-                    description=f"{APP_NAME} native {name} {width}x{height}",
+                    description=(
+                        None if requires_raw_ome else f"{APP_NAME} native {name} {width}x{height}"
+                    ),
                     subfiletype=9 if name == "macro" else 1,
+                    metadata={"Name": name} if requires_raw_ome else None,
                 )
                 overall_done += 1
                 _emit_progress(
@@ -640,7 +862,30 @@ def _write_generic_native_tiff(
                     overall_total,
                 )
 
-    perf["native_tile_mode"] = getattr(slide, "native_tile_mode", "unknown")
+        if requires_raw_ome:
+            written_raw_tiles = _write_native_raw_ome_series(
+                tif,
+                slide,
+                tile_size=tile_size,
+                mpp_x=mpp_x,
+                mpp_y=mpp_y,
+                cancel_event=cancel_event,
+            )
+            overall_done += written_raw_tiles
+            _emit_progress(
+                progress_callback,
+                "写出 OME 原始平面",
+                written_raw_tiles,
+                raw_tiles,
+                overall_done,
+                overall_total,
+            )
+
+    perf["native_tile_mode"] = (
+        "rgb_composite_plus_raw"
+        if requires_raw_ome
+        else getattr(slide, "native_tile_mode", "unknown")
+    )
     perf["level_dimensions"] = list(slide.level_dimensions)
     perf["max_level_reached"] = max(0, len(levels) - 1)
     _advance_write_tail_progress(
@@ -744,7 +989,7 @@ def write_aperio_associated_images(
     associated_total = _svs_associated_units(options)
     associated_done = 0
 
-    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+    if _is_native_source(slide) and getattr(slide, "native_resource_status", "") == "native":
         for name, enabled, subfiletype in (
             ("label", options.svs_generate_label, 1),
             ("macro", options.svs_generate_macro, 9),
@@ -756,7 +1001,7 @@ def write_aperio_associated_images(
                 continue
             perf["current_stage"] = "生成附属图像"
             started = time.perf_counter()
-            width, height = _write_native_rgb_page(
+            width, height = _write_native_page(
                 tif,
                 image,
                 description=f"Aperio Image Library v12.0.0 \n{name} {image.width}x{image.height}",
@@ -871,7 +1116,7 @@ def write_aperio_thumbnail_page(
     thumb_started = time.perf_counter()
     native = _native_resource_image(slide, "thumbnail")
     if native is not None:
-        _write_native_rgb_page(
+        _write_native_page(
             tif,
             native,
             description=f"Aperio Image Library v12.0.0 \nthumbnail {native.width}x{native.height}",
@@ -1033,7 +1278,7 @@ def _write_svs_native_streaming(
         )
         perf.update({key: value for key, value in associated.items() if value is not None})
 
-    perf["native_tile_mode"] = "reencoded"
+    perf["native_tile_mode"] = "svs_reencoded"
     completed = overall_done + associated_units + 1
     _advance_write_tail_progress(
         perf,
@@ -1063,7 +1308,7 @@ def _write_generic_tiff_streaming(
     further pyramid level is generated by cascading (resize → write) from
     that buffer, giving per-tile progress for every level.
     """
-    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+    if _native_output_ready(slide):
         return _write_generic_native_tiff(
             slide,
             output_path,
@@ -1265,7 +1510,7 @@ def _write_svs_streaming_direct(
     The 8× pyramid level is generated in-memory from the completed 4×
     buffer.  No pyvips/libvips or intermediate temporary files needed.
     """
-    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+    if _native_output_ready(slide):
         return _write_svs_native_streaming(
             slide,
             output_path,
@@ -1495,6 +1740,18 @@ def write_image(
         "native_resource_dimensions": None,
         "native_tile_mode": None,
         "native_fallback_reason": None,
+        "source_container": getattr(slide, "source_container", None),
+        "source_version": getattr(slide, "source_version", None),
+        "source_codec": getattr(slide, "source_codec", None),
+        "source_bit_depth": getattr(slide, "source_bit_depth", None),
+        "source_channel_count": getattr(slide, "source_channel_count", None),
+        "source_axes": getattr(slide, "native_axes", None),
+        "compatibility_level": getattr(slide, "compatibility_level", None),
+        "diagnostic_code": getattr(slide, "diagnostic_code", None),
+        "diagnostic_stage": getattr(slide, "diagnostic_stage", None),
+        "svs_omitted_native_data": (
+            _svs_omitted_native_data(slide) if options.output_format == "svs" else None
+        ),
         "failure_stage": None,
         **parallel,
     }

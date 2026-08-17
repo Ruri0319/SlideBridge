@@ -167,6 +167,16 @@ class ConvertResult:
     native_resource_dimensions: dict[str, tuple[int, int] | None] | None = None
     native_tile_mode: str | None = None
     native_fallback_reason: str | None = None
+    source_container: str | None = None
+    source_version: str | None = None
+    source_codec: str | None = None
+    source_bit_depth: int | None = None
+    source_channel_count: int | None = None
+    source_axes: str | None = None
+    compatibility_level: str | None = None
+    diagnostic_code: str | None = None
+    diagnostic_stage: str | None = None
+    svs_omitted_native_data: str | None = None
 
 
 @dataclass

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+from io import BytesIO
 from unittest import mock
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from ibl2svs.converter import convert_file
+from ibl2svs.kfb_source import KfbSlideSource
 from ibl2svs.models import ConvertOptions
 from ibl2svs.punuoxi_source import PunuoxiImageSource
 from ibl2svs.tiff_source import TiffSlideSource
@@ -19,7 +22,7 @@ from ibl2svs.writer import (
     write_image,
     WriteImageError,
 )
-from tests.support import create_sample_ibl, create_sample_image
+from tests.support import create_sample_ibl, create_sample_image, create_sample_kfb, create_sample_kfba
 
 
 TIFFFILE_AVAILABLE = importlib.util.find_spec("tifffile") is not None
@@ -220,7 +223,7 @@ class WriterTests(unittest.TestCase):
 
             self.assertTrue(result.success, result.error)
             self.assertTrue(result.native_path)
-            self.assertEqual(result.native_tile_mode, "reencoded")
+            self.assertEqual(result.native_tile_mode, "svs_reencoded")
             self.assertEqual(result.svs_label_dimensions, (300, 294))
             self.assertEqual(result.svs_macro_dimensions, (1152, 625))
             with tifffile.TiffFile(output) as tif:
@@ -235,6 +238,132 @@ class WriterTests(unittest.TestCase):
                 self.assertTrue(np.all(tif.pages[1].asarray() == [10, 20, 30]))
                 self.assertTrue(np.all(tif.pages[3].asarray() == [70, 80, 90]))
                 self.assertTrue(np.all(tif.pages[4].asarray() == [40, 50, 60]))
+
+    def test_native_kfb_generic_tiff_preserves_levels_jpeg_tables_and_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "native.kfbf"
+            output = root / "native.tif"
+            create_sample_kfb(sample, variant="kfbf")
+
+            with KfbSlideSource(sample) as source:
+                expected = source.read_level_region(0, 0, 0, source.width, source.height)
+                expected_thumbnail = np.asarray(source.get_thumbnail_image())
+                expected_macro = np.asarray(source.get_macro_image())
+                expected_label = np.asarray(source.get_label_image())
+                first = source.levels[0].records[0]
+                source_jpeg = source._read_at(first.offset, first.length)
+                source_quantization = Image.open(BytesIO(source_jpeg)).quantization
+
+            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success, result.error)
+            self.assertTrue(result.native_path)
+            self.assertEqual(result.native_tile_mode, "jpeg_passthrough")
+            self.assertEqual(result.compatibility_level, "sample_verified")
+            self.assertEqual(result.native_level_dimensions, [(24, 18), (12, 9)])
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual(len(tif.pages), 5)
+                self.assertEqual((tif.pages[0].tilewidth, tif.pages[0].tilelength), (16, 16))
+                np.testing.assert_allclose(tif.pages[0].asarray(), expected, atol=3)
+                offset = tif.pages[0].dataoffsets[0]
+                size = tif.pages[0].databytecounts[0]
+                tif.filehandle.seek(offset)
+                output_jpeg = tif.filehandle.read(size)
+                self.assertEqual(Image.open(BytesIO(output_jpeg)).quantization, source_quantization)
+                self.assertEqual(tif.pages[2].shape, (9, 12, 3))
+                self.assertEqual(tif.pages[3].shape, (24, 64, 3))
+                self.assertEqual(tif.pages[4].shape, (40, 32, 3))
+                np.testing.assert_array_equal(tif.pages[2].asarray(), expected_thumbnail)
+                np.testing.assert_array_equal(tif.pages[3].asarray(), expected_macro)
+                np.testing.assert_array_equal(tif.pages[4].asarray(), expected_label)
+
+    def test_native_kfb_svs_uses_240_tiles_and_preserves_associated_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "native.kfbf"
+            output = root / "native.svs"
+            create_sample_kfb(sample, variant="kfbf")
+            with KfbSlideSource(sample) as source:
+                expected_main = source.read_level_region(0, 0, 0, source.width, source.height)
+                expected_thumbnail = np.asarray(source.get_thumbnail_image())
+                expected_macro = np.asarray(source.get_macro_image())
+                expected_label = np.asarray(source.get_label_image())
+
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    output_format="svs",
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                ),
+            )
+
+            self.assertTrue(result.success, result.error)
+            self.assertEqual(result.native_tile_mode, "svs_reencoded")
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual((tif.pages[0].tilewidth, tif.pages[0].tilelength), (240, 240))
+                np.testing.assert_allclose(tif.pages[0].asarray(), expected_main, atol=8)
+                np.testing.assert_array_equal(tif.pages[1].asarray(), expected_thumbnail)
+                np.testing.assert_array_equal(tif.pages[-2].asarray(), expected_label)
+                np.testing.assert_array_equal(tif.pages[-1].asarray(), expected_macro)
+
+    def test_kfba_generic_tiff_writes_rgb_pyramid_and_raw_ome_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "multi.kfba"
+            output = root / "multi.tif"
+            create_sample_kfba(sample)
+
+            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success, result.error)
+            self.assertEqual(result.native_tile_mode, "rgb_composite_plus_raw")
+            self.assertEqual(result.source_axes, "TZCYX")
+            with tifffile.TiffFile(output) as tif:
+                self.assertTrue(tif.is_ome)
+                self.assertEqual(tif.series[0].shape, (18, 24, 3))
+                self.assertEqual(len(tif.series[0].levels), 2)
+                raw_series = [series for series in tif.series if series.name.endswith(" raw")]
+                self.assertEqual(len(raw_series), 2)
+                field0 = raw_series[0].asarray()
+                field1 = raw_series[1].asarray()
+                self.assertEqual(field0.shape, (2, 18, 24))
+                self.assertEqual(field1.shape, (2, 18, 24))
+                np.testing.assert_allclose(field0[0], 30, atol=2)
+                np.testing.assert_allclose(field0[1], 120, atol=2)
+                np.testing.assert_allclose(field1[0], 70, atol=2)
+                np.testing.assert_allclose(field1[1], 160, atol=2)
+                self.assertIn('Name="Red"', tif.ome_metadata)
+                self.assertIn('Name="Green"', tif.ome_metadata)
+                self.assertIn('PhysicalSizeX="0.25"', tif.ome_metadata)
+
+    def test_kfba_svs_reports_omitted_raw_fields_and_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "multi.kfba"
+            output = root / "multi.svs"
+            create_sample_kfba(sample)
+
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    output_format="svs",
+                    tile_size=16,
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                ),
+            )
+
+            self.assertTrue(result.success, result.error)
+            self.assertEqual(result.native_tile_mode, "svs_reencoded")
+            self.assertIn("fields=2", result.svs_omitted_native_data)
+            self.assertIn("C=2", result.svs_omitted_native_data)
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual((tif.pages[0].tilewidth, tif.pages[0].tilelength), (16, 16))
+                np.testing.assert_allclose(tif.pages[0].asarray()[0, 0], [30, 120, 0], atol=4)
 
     def test_image_string_scan_time_is_rendered_on_svs_label(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -46,7 +46,7 @@ def detect_input_format(path: str | Path) -> str:
         return "svs"
     if suffix in {".tif", ".tiff"}:
         return "generic_tiff"
-    if suffix in {".kfb", ".kfbf"}:
+    if suffix in {".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx"}:
         return "kfb"
     if suffix == ".image":
         return "image"
@@ -61,9 +61,9 @@ def find_convertible_files(
     input_dir = Path(input_dir)
     pattern = "**/*" if recursive else "*"
     if output_format == "svs":
-        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".kfbf", ".image"}
+        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx", ".image"}
     else:
-        suffixes = {".ibl", ".svs", ".kfb", ".kfbf", ".image"}
+        suffixes = {".ibl", ".svs", ".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx", ".image"}
     files = [
         path
         for path in input_dir.glob(pattern)
@@ -163,6 +163,16 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                 "native_resource_dimensions",
                 "native_tile_mode",
                 "native_fallback_reason",
+                "source_container",
+                "source_version",
+                "source_codec",
+                "source_bit_depth",
+                "source_channel_count",
+                "source_axes",
+                "compatibility_level",
+                "diagnostic_code",
+                "diagnostic_stage",
+                "svs_omitted_native_data",
                 "failure_stage",
                 "error_code",
                 "error",
@@ -204,6 +214,16 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                     str(result.native_resource_dimensions or ""),
                     result.native_tile_mode or "",
                     result.native_fallback_reason or "",
+                    result.source_container or "",
+                    result.source_version or "",
+                    result.source_codec or "",
+                    result.source_bit_depth if result.source_bit_depth is not None else "",
+                    result.source_channel_count if result.source_channel_count is not None else "",
+                    result.source_axes or "",
+                    result.compatibility_level or "",
+                    result.diagnostic_code or "",
+                    result.diagnostic_stage or "",
+                    result.svs_omitted_native_data or "",
                     result.failure_stage or "",
                     result.error_code or "",
                     result.error or "",
@@ -305,6 +325,16 @@ def convert_file(
                 native_resource_dimensions=perf.get("native_resource_dimensions"),
                 native_tile_mode=perf.get("native_tile_mode"),
                 native_fallback_reason=perf.get("native_fallback_reason"),
+                source_container=perf.get("source_container"),
+                source_version=perf.get("source_version"),
+                source_codec=perf.get("source_codec"),
+                source_bit_depth=perf.get("source_bit_depth"),
+                source_channel_count=perf.get("source_channel_count"),
+                source_axes=perf.get("source_axes"),
+                compatibility_level=perf.get("compatibility_level"),
+                diagnostic_code=perf.get("diagnostic_code"),
+                diagnostic_stage=perf.get("diagnostic_stage"),
+                svs_omitted_native_data=perf.get("svs_omitted_native_data"),
             )
             if logger:
                 logger(
@@ -324,6 +354,16 @@ def convert_file(
                     )
                 elif result.native_fallback_reason:
                     logger(f"原生资源回退: {result.native_fallback_reason}")
+                if result.compatibility_level:
+                    logger(
+                        "兼容性: "
+                        f"{result.compatibility_level}, "
+                        f"container={result.source_container or 'unknown'}, "
+                        f"version={result.source_version or 'unknown'}, "
+                        f"codec={result.source_codec or 'unknown'}"
+                    )
+                if result.svs_omitted_native_data:
+                    logger(f"SVS 未保存原始数据: {result.svs_omitted_native_data}")
                 logger(
                     "性能: "
                     f"read/decode={result.read_decode_sec:.2f}s, "
@@ -379,6 +419,16 @@ def convert_file(
             native_resource_dimensions=perf.get("native_resource_dimensions"),
             native_tile_mode=perf.get("native_tile_mode"),
             native_fallback_reason=perf.get("native_fallback_reason"),
+            source_container=perf.get("source_container"),
+            source_version=perf.get("source_version"),
+            source_codec=perf.get("source_codec"),
+            source_bit_depth=perf.get("source_bit_depth"),
+            source_channel_count=perf.get("source_channel_count"),
+            source_axes=perf.get("source_axes"),
+            compatibility_level=perf.get("compatibility_level"),
+            diagnostic_code=perf.get("diagnostic_code"),
+            diagnostic_stage=perf.get("diagnostic_stage"),
+            svs_omitted_native_data=perf.get("svs_omitted_native_data"),
             error_code=error_code,
             error=str(exc),
         )
@@ -396,6 +446,10 @@ def convert_file(
             error_code = "CONVERT_FAILED"
         if logger:
             logger(f"失败: {input_path.name}: {exc}")
+        diagnostic_code = getattr(exc, "diagnostic_code", None)
+        diagnostic_stage = getattr(exc, "diagnostic_stage", None)
+        if diagnostic_code:
+            error_code = diagnostic_code
         return ConvertResult(
             input_path=input_path,
             output_path=existing_output_path(),
@@ -405,6 +459,15 @@ def convert_file(
             output_format=options.output_format,
             backend=options.performance_backend,
             duration_sec=duration,
+            source_container=getattr(exc, "source_container", None),
+            source_version=getattr(exc, "source_version", None),
+            compatibility_level=(
+                "static_unverified"
+                if getattr(exc, "source_container", None) in {"kfba", "kfbx"}
+                else None
+            ),
+            diagnostic_code=diagnostic_code,
+            diagnostic_stage=diagnostic_stage,
             error_code=error_code,
             error=str(exc),
         )

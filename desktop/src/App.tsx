@@ -340,6 +340,21 @@ export default function App() {
         completedFiles.current.add(result.input_path);
         fileProgressByPath.current.set(result.input_path, 1);
         filePhaseByPath.current.set(result.input_path, phases.length - 1);
+        if (result.compatibility_level === "static_unverified") {
+          appendLog(
+            `${basename(result.input_path)}: static_unverified · ${result.source_container || "KFB"} ${result.source_version || "unknown"}`,
+          );
+        }
+        if (result.diagnostic_code) {
+          appendLog(
+            `${basename(result.input_path)}: ${result.diagnostic_code} · ${result.diagnostic_stage || "parse"}`,
+          );
+        }
+        if (result.svs_omitted_native_data) {
+          appendLog(
+            `${basename(result.input_path)}: SVS 未保存原始数据 · ${result.svs_omitted_native_data}`,
+          );
+        }
       }
       completedCount.current = Math.max(completedFiles.current.size, batch.results.length);
       if (!batch.cancelled) lastBatchPercent.current = 100;
@@ -711,7 +726,7 @@ function TaskComposer({
       <div className="format-note" aria-label="支持的输入格式">
         <span className="format-note-label">输入格式</span>
         <span className="format-note-values">
-          .ibl · .kfb/.kfbf · <strong>.image</strong> · .svs · .tif/.tiff
+          .ibl · .kfb/.kfbl/.kfbf/.kfba/.kfbx · <strong>.image</strong> · .svs · .tif/.tiff
         </span>
         <span className="format-note-auto">自动识别</span>
       </div>

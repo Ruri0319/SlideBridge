@@ -44,6 +44,16 @@ export interface ConvertResultPayload {
   native_resource_dimensions: Record<string, [number, number] | null> | null;
   native_tile_mode: string | null;
   native_fallback_reason: string | null;
+  source_container: string | null;
+  source_version: string | null;
+  source_codec: string | null;
+  source_bit_depth: number | null;
+  source_channel_count: number | null;
+  source_axes: string | null;
+  compatibility_level: string | null;
+  diagnostic_code: string | null;
+  diagnostic_stage: string | null;
+  svs_omitted_native_data: string | null;
   failure_stage: string | null;
   error_code: string | null;
   error: string | null;

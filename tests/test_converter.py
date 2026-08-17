@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import struct
 from pathlib import Path
 from unittest import mock
 
@@ -44,20 +45,23 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(detect_input_format("a.tiff"), "generic_tiff")
         self.assertEqual(detect_input_format("a.kfb"), "kfb")
         self.assertEqual(detect_input_format("a.kfbf"), "kfb")
+        self.assertEqual(detect_input_format("a.kfbl"), "kfb")
+        self.assertEqual(detect_input_format("a.kfba"), "kfb")
+        self.assertEqual(detect_input_format("a.kfbx"), "kfb")
         self.assertEqual(detect_input_format("a.image"), "image")
         self.assertEqual(detect_input_format("a.txt"), "unsupported")
 
     def test_find_convertible_files_depends_on_output_format(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "f.txt"]:
+            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx", "f.txt"]:
                 (root / name).write_text("x")
 
             to_svs = find_convertible_files(root, recursive=False, output_format="svs")
             to_tiff = find_convertible_files(root, recursive=False, output_format="generic_tiff")
 
-            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image"])
-            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.kfbf", "g.image"])
+            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx"])
+            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx"])
 
     def test_build_output_path_avoids_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -106,6 +110,7 @@ class ConverterTests(unittest.TestCase):
             text = report.read_text(encoding="utf-8-sig")
 
             self.assertIn("input_format", text.splitlines()[0])
+            self.assertIn("svs_omitted_native_data", text.splitlines()[0])
             self.assertIn("svs", text)
 
     def test_convert_file_marks_cancelled_and_removes_partial_output(self) -> None:
@@ -170,6 +175,24 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(result.height, 18)
             self.assertEqual(result.mpp, 0.25)
             self.assertTrue(output.exists())
+
+    def test_unknown_kfb_layout_returns_diagnostic_without_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "unknown.kfb"
+            output = root / "unknown.tif"
+            create_sample_kfb(source)
+            with source.open("r+b") as fh:
+                fh.seek(0x0C)
+                fh.write(struct.pack("<f", 3.0))
+
+            result = convert_file(source, output, ConvertOptions(tile_size=16))
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.diagnostic_code, "unsupported_version")
+            self.assertEqual(result.diagnostic_stage, "header")
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".tif.part").exists())
 
     def test_convert_file_accepts_image_source(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
