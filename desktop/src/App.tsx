@@ -711,7 +711,7 @@ function TaskComposer({
       <div className="format-note" aria-label="支持的输入格式">
         <span className="format-note-label">输入格式</span>
         <span className="format-note-values">
-          .ibl · .kfb · <strong>.image</strong> · .svs · .tif/.tiff
+          .ibl · .kfb/.kfbf · <strong>.image</strong> · .svs · .tif/.tiff
         </span>
         <span className="format-note-auto">自动识别</span>
       </div>

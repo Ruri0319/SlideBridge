@@ -27,6 +27,7 @@ def create_sample_image(
     *,
     directional_tile: bool = False,
     empty_tiles: set[tuple[int, int, int]] | None = None,
+    include_native_resources: bool = False,
 ) -> None:
     """Create a small file matching the investigated private .image layout."""
     width = 512
@@ -61,6 +62,19 @@ def create_sample_image(
     header[0x98 : 0x98 + len("CASE-001")] = b"CASE-001"
 
     payload = bytearray(header)
+    if include_native_resources:
+        thumbnail_offset = len(payload)
+        thumbnail = Image.new("RGB", (300, 5), (10, 20, 30)).tobytes()
+        macro = Image.new("RGB", (1152, 625), (40, 50, 60)).tobytes()
+        label = Image.new("RGB", (300, 294), (70, 80, 90)).tobytes()
+        payload.extend(thumbnail)
+        payload.extend(macro)
+        payload.extend(b"\x00" * 24)
+        label_offset = len(payload)
+        payload.extend(label)
+        struct.pack_into("<Q", payload, 0x00, thumbnail_offset)
+        struct.pack_into("<Q", payload, 0x08, label_offset)
+
     entries: list[tuple[int, int, int]] = []
     for level_index, (columns, rows, colors) in enumerate(levels):
         # The private container stores records column-major, while ``colors``
@@ -113,7 +127,7 @@ def _kfb_image_record(image_type: int, blob: bytes, width: int, height: int) -> 
     return bytes(record) + blob
 
 
-def _kfb_tile_record(spec: dict, tile_index_offset: int) -> bytes:
+def _kfb_tile_record(spec: dict, tile_index_offset: int, *, indirect: bool = False) -> bytes:
     record = bytearray(64)
     record[0:4] = b"\xf1\x04\xee\xee"
     struct.pack_into("<i", record, 4, spec["x"])
@@ -122,15 +136,30 @@ def _kfb_tile_record(spec: dict, tile_index_offset: int) -> bytes:
     struct.pack_into("<i", record, 16, spec["height"])
     struct.pack_into("<f", record, 20, spec["scale"])
     struct.pack_into("<i", record, 32, len(spec["blob"]))
-    struct.pack_into("<i", record, 36, spec["offset"] - tile_index_offset)
+    if indirect:
+        struct.pack_into("<I", record, 36, spec["offset_ref"])
+    else:
+        struct.pack_into("<i", record, 36, spec["offset"] - tile_index_offset)
     struct.pack_into("<i", record, 40, -1)
-    for offset in (44, 48, 52, 56):
-        struct.pack_into("<i", record, offset, 20)
+    if indirect:
+        struct.pack_into("<I", record, 44, spec["size_ref"])
+        for offset in (48, 52, 56):
+            struct.pack_into("<i", record, offset, 0)
+    else:
+        for offset in (44, 48, 52, 56):
+            struct.pack_into("<i", record, offset, 20)
     record[60:64] = b"\xff\x04\xee\xee"
     return bytes(record)
 
 
-def create_sample_kfb(path: Path, *, include_preview_level: bool = True) -> None:
+def create_sample_kfb(
+    path: Path,
+    *,
+    include_preview_level: bool = True,
+    variant: str = "kfb",
+) -> None:
+    if variant not in {"kfb", "kfbf"}:
+        raise ValueError(f"unsupported KFB fixture variant: {variant}")
     width = 24
     height = 18
     tile_size = 16
@@ -163,14 +192,29 @@ def create_sample_kfb(path: Path, *, include_preview_level: bool = True) -> None
         tile_data.extend(blob)
         current_offset += len(blob)
 
-    tile_index_offset = current_offset
-    tile_index = b"".join(_kfb_tile_record(spec, tile_index_offset) for spec in tile_specs)
+    indirect = variant == "kfbf"
+    pointer_tables = bytearray()
+    if indirect:
+        offset_ref_start = current_offset
+        size_ref_start = offset_ref_start + len(tile_specs) * 8
+        for index, spec in enumerate(tile_specs):
+            spec["offset_ref"] = offset_ref_start + index * 8
+            spec["size_ref"] = size_ref_start + index * 8
+            pointer_tables.extend(struct.pack("<Q", spec["offset"]))
+        for spec in tile_specs:
+            pointer_tables.extend(struct.pack("<Q", len(spec["blob"])))
+
+    tile_index_offset = current_offset + len(pointer_tables)
+    tile_index = b"".join(
+        _kfb_tile_record(spec, tile_index_offset, indirect=indirect)
+        for spec in tile_specs
+    )
     last_image_offset = tile_index_offset + len(tile_index)
     thumb_record = _kfb_image_record(2, thumb_blob, 12, 9)
 
     header = bytearray(header_size)
     header[0:4] = b"\xf1\x01\xee\xee"
-    header[4:8] = b"KFB\x00"
+    header[4:8] = b"KFBF" if indirect else b"KFB\x00"
     struct.pack_into("<f", header, 0x0C, 1.0)
     struct.pack_into("<I", header, 0x10, len(tile_specs))
     struct.pack_into("<I", header, 0x14, height)
@@ -193,7 +237,15 @@ def create_sample_kfb(path: Path, *, include_preview_level: bool = True) -> None
     metadata.extend(device)
     header[0x5C : 0x5C + len(metadata)] = metadata
 
-    path.write_bytes(bytes(header) + macro_record + label_record + bytes(tile_data) + tile_index + thumb_record)
+    path.write_bytes(
+        bytes(header)
+        + macro_record
+        + label_record
+        + bytes(tile_data)
+        + bytes(pointer_tables)
+        + tile_index
+        + thumb_record
+    )
 
 
 def create_sample_ibl(

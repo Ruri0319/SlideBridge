@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from ibl2svs.converter import convert_file
 from ibl2svs.models import ConvertOptions
 from ibl2svs.punuoxi_source import PunuoxiImageSource
@@ -169,6 +171,70 @@ class WriterTests(unittest.TestCase):
                 blank = source.read_region(0, 256, 64, 64)
             self.assertEqual(int(blank.min()), 250)
             self.assertEqual(int(blank.max()), 250)
+
+    def test_native_image_generic_tiff_preserves_levels_and_associated_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "native.image"
+            output = root / "native.tif"
+            create_sample_image(sample, include_native_resources=True)
+
+            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+
+            self.assertTrue(result.success, result.error)
+            self.assertTrue(result.native_path)
+            self.assertEqual(result.native_tile_mode, "lossless_transpose")
+            self.assertEqual(result.native_level_dimensions, [(512, 512), (256, 256)])
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual(len(tif.pages), 5)
+                self.assertEqual(tif.pages[0].shape, (512, 512, 3))
+                self.assertEqual(tif.pages[1].shape, (256, 256, 3))
+                self.assertEqual(tif.pages[2].shape, (5, 300, 3))
+                self.assertEqual(tif.pages[3].shape, (625, 1152, 3))
+                self.assertEqual(tif.pages[4].shape, (294, 300, 3))
+                self.assertEqual(int(tif.pages[2].compression), 5)
+                self.assertIn("native thumbnail", (tif.pages[2].description or "").lower())
+                self.assertIn("native macro", (tif.pages[3].description or "").lower())
+                self.assertIn("native label", (tif.pages[4].description or "").lower())
+                self.assertTrue(np.all(tif.pages[2].asarray() == [10, 20, 30]))
+                self.assertTrue(np.all(tif.pages[3].asarray() == [40, 50, 60]))
+                self.assertTrue(np.all(tif.pages[4].asarray() == [70, 80, 90]))
+
+    def test_native_image_svs_preserves_associated_images_and_uses_native_levels(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "native.image"
+            output = root / "native.svs"
+            create_sample_image(sample, include_native_resources=True)
+
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    output_format="svs",
+                    tile_size=16,
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                ),
+            )
+
+            self.assertTrue(result.success, result.error)
+            self.assertTrue(result.native_path)
+            self.assertEqual(result.native_tile_mode, "reencoded")
+            self.assertEqual(result.svs_label_dimensions, (300, 294))
+            self.assertEqual(result.svs_macro_dimensions, (1152, 625))
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual(len(tif.pages), 5)
+                self.assertEqual(tif.pages[1].shape, (5, 300, 3))
+                self.assertEqual(tif.pages[2].shape, (128, 128, 3))
+                self.assertEqual(tif.pages[3].shape, (294, 300, 3))
+                self.assertEqual(tif.pages[4].shape, (625, 1152, 3))
+                self.assertEqual(int(tif.pages[1].compression), 5)
+                self.assertEqual(int(tif.pages[3].compression), 5)
+                self.assertEqual(int(tif.pages[4].compression), 5)
+                self.assertTrue(np.all(tif.pages[1].asarray() == [10, 20, 30]))
+                self.assertTrue(np.all(tif.pages[3].asarray() == [70, 80, 90]))
+                self.assertTrue(np.all(tif.pages[4].asarray() == [40, 50, 60]))
 
     def test_image_string_scan_time_is_rendered_on_svs_label(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

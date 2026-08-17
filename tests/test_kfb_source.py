@@ -32,6 +32,22 @@ class KfbSlideSourceTests(unittest.TestCase):
             np.testing.assert_allclose(region[3, 0], [140, 150, 160], atol=3)
             np.testing.assert_allclose(region[3, 4], [200, 210, 220], atol=3)
 
+    def test_reads_kfbf_indirect_tile_pointers(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "sample.kfbf"
+            create_sample_kfb(path, variant="kfbf")
+
+            with KfbSlideSource(path) as source:
+                self.assertEqual(source.container_variant, "kfbf")
+                self.assertEqual(source.width, 24)
+                self.assertEqual(source.height, 18)
+                region = source.read_region(14, 14, 8, 4)
+
+            np.testing.assert_allclose(region[0, 0], [20, 30, 40], atol=3)
+            np.testing.assert_allclose(region[0, 4], [80, 90, 100], atol=3)
+            np.testing.assert_allclose(region[3, 0], [140, 150, 160], atol=3)
+            np.testing.assert_allclose(region[3, 4], [200, 210, 220], atol=3)
+
     def test_returns_associated_images(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.kfb"

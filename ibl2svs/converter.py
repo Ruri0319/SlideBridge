@@ -46,7 +46,7 @@ def detect_input_format(path: str | Path) -> str:
         return "svs"
     if suffix in {".tif", ".tiff"}:
         return "generic_tiff"
-    if suffix == ".kfb":
+    if suffix in {".kfb", ".kfbf"}:
         return "kfb"
     if suffix == ".image":
         return "image"
@@ -61,9 +61,9 @@ def find_convertible_files(
     input_dir = Path(input_dir)
     pattern = "**/*" if recursive else "*"
     if output_format == "svs":
-        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".image"}
+        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".kfbf", ".image"}
     else:
-        suffixes = {".ibl", ".svs", ".kfb", ".image"}
+        suffixes = {".ibl", ".svs", ".kfb", ".kfbf", ".image"}
     files = [
         path
         for path in input_dir.glob(pattern)
@@ -158,6 +158,11 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                 "svs_photometric_pages",
                 "svs_finalize_backend",
                 "max_level_reached",
+                "native_path",
+                "native_level_dimensions",
+                "native_resource_dimensions",
+                "native_tile_mode",
+                "native_fallback_reason",
                 "failure_stage",
                 "error_code",
                 "error",
@@ -194,6 +199,11 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                     "|".join(result.svs_photometric_pages or []),
                     result.svs_finalize_backend or "",
                     result.max_level_reached or "",
+                    result.native_path,
+                    "|".join(f"{w}x{h}" for w, h in (result.native_level_dimensions or [])),
+                    str(result.native_resource_dimensions or ""),
+                    result.native_tile_mode or "",
+                    result.native_fallback_reason or "",
                     result.failure_stage or "",
                     result.error_code or "",
                     result.error or "",
@@ -290,6 +300,11 @@ def convert_file(
                 svs_finalize_backend=perf.get("svs_finalize_backend"),
                 max_level_reached=perf.get("max_level_reached"),
                 failure_stage=perf.get("failure_stage"),
+                native_path=bool(perf.get("native_path", False)),
+                native_level_dimensions=perf.get("native_level_dimensions"),
+                native_resource_dimensions=perf.get("native_resource_dimensions"),
+                native_tile_mode=perf.get("native_tile_mode"),
+                native_fallback_reason=perf.get("native_fallback_reason"),
             )
             if logger:
                 logger(
@@ -301,6 +316,14 @@ def convert_file(
                     f"backend={result.backend}"
                 )
                 logger(f"完成: {input_path.name} -> {output_path.name}")
+                if result.native_path:
+                    logger(
+                        "原生路径: "
+                        f"tile_mode={result.native_tile_mode or 'unknown'}, "
+                        f"levels={len(result.native_level_dimensions or [])}"
+                    )
+                elif result.native_fallback_reason:
+                    logger(f"原生资源回退: {result.native_fallback_reason}")
                 logger(
                     "性能: "
                     f"read/decode={result.read_decode_sec:.2f}s, "
@@ -351,6 +374,11 @@ def convert_file(
             svs_finalize_backend=perf.get("svs_finalize_backend"),
             max_level_reached=perf.get("max_level_reached"),
             failure_stage=perf.get("failure_stage"),
+            native_path=bool(perf.get("native_path", False)),
+            native_level_dimensions=perf.get("native_level_dimensions"),
+            native_resource_dimensions=perf.get("native_resource_dimensions"),
+            native_tile_mode=perf.get("native_tile_mode"),
+            native_fallback_reason=perf.get("native_fallback_reason"),
             error_code=error_code,
             error=str(exc),
         )

@@ -11,10 +11,13 @@ import threading
 import numpy as np
 from PIL import Image
 
+from .jpeg_transform import transpose_jpeg
 from .models import BaseInfo
 
 
 HEADER_MIN_SIZE = 0xAC
+THUMBNAIL_OFFSET_OFFSET = 0x00
+LABEL_OFFSET_OFFSET = 0x08
 INDEX_OFFSET_OFFSET = 0x10
 PHYSICAL_WIDTH_OFFSET = 0x18
 PHYSICAL_HEIGHT_OFFSET = 0x1C
@@ -30,6 +33,12 @@ TAIL_SIZE = 33
 LEVEL_HEADER_SIZE = 8
 INDEX_RECORD_SIZE = 12
 HEX_ID_RE = re.compile(rb"^[0-9a-fA-F]{32}\x00$")
+NATIVE_THUMBNAIL_WIDTH = 300
+NATIVE_MACRO_WIDTH = 1152
+NATIVE_MACRO_HEIGHT = 625
+NATIVE_MACRO_PIXEL_BYTES = NATIVE_MACRO_WIDTH * NATIVE_MACRO_HEIGHT * 3
+NATIVE_MACRO_TRAILER_BYTES = 24
+NATIVE_LABEL_WIDTH = 300
 
 
 class PunuoxiFormatError(RuntimeError):
@@ -43,7 +52,6 @@ class PunuoxiTileRecord:
     row: int
     jpeg_length: int
     jpeg_offset: int
-    reserved: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,18 @@ class PunuoxiImageSource:
         self._tile_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._preview_image: Image.Image | None = None
         self._thumbnail_image: Image.Image | None = None
+        self._macro_image: Image.Image | None = None
+        self._label_image: Image.Image | None = None
+        self._thumbnail_offset = 0
+        self._label_offset = 0
+        self._native_resource_status = "unavailable"
+        self._native_resource_reason = "文件未声明原生附属图资源"
+        self._native_tile_mode = "uninitialized"
+        self._native_resources: dict[str, tuple[int, int, int] | None] = {
+            "thumbnail": None,
+            "macro": None,
+            "label": None,
+        }
 
         try:
             self._file_size = self.path.stat().st_size
@@ -114,6 +134,7 @@ class PunuoxiImageSource:
             self._levels = self._parse_levels()
             if not self._levels:
                 raise PunuoxiFormatError("IMAGE 未包含金字塔索引")
+            self._parse_native_resources()
 
             self.width = self._header_width
             self.height = self._header_height
@@ -145,6 +166,14 @@ class PunuoxiImageSource:
         return self.height, self.width, self.channels
 
     @property
+    def mpp_x(self) -> float:
+        return self._physical_width_um / self.width
+
+    @property
+    def mpp_y(self) -> float:
+        return self._physical_height_um / self.height
+
+    @property
     def levels(self) -> tuple[PunuoxiLevel, ...]:
         return tuple(self._levels)
 
@@ -155,6 +184,29 @@ class PunuoxiImageSource:
     @property
     def tail_identifier(self) -> str:
         return self._tail_identifier
+
+    @property
+    def native_resource_status(self) -> str:
+        return self._native_resource_status
+
+    @property
+    def native_resource_reason(self) -> str:
+        return self._native_resource_reason
+
+    @property
+    def native_tile_mode(self) -> str:
+        return self._native_tile_mode
+
+    @property
+    def native_resource_dimensions(self) -> dict[str, tuple[int, int] | None]:
+        return {
+            name: (value[1], value[2]) if value else None
+            for name, value in self._native_resources.items()
+        }
+
+    @property
+    def supports_native_pyramid(self) -> bool:
+        return bool(self._levels)
 
     def _read_at(self, offset: int, size: int) -> bytes:
         with self._lock:
@@ -175,6 +227,8 @@ class PunuoxiImageSource:
             raise PunuoxiFormatError("IMAGE 尾部 32 字节标识无效")
         self._tail_identifier = tail[:-1].decode("ascii").lower()
 
+        self._thumbnail_offset = int(_unpack_from("<Q", data, THUMBNAIL_OFFSET_OFFSET))
+        self._label_offset = int(_unpack_from("<Q", data, LABEL_OFFSET_OFFSET))
         self._index_offset = int(_unpack_from("<Q", data, INDEX_OFFSET_OFFSET))
         self._physical_width_um = float(_unpack_from("<f", data, PHYSICAL_WIDTH_OFFSET))
         self._physical_height_um = float(_unpack_from("<f", data, PHYSICAL_HEIGHT_OFFSET))
@@ -235,8 +289,7 @@ class PunuoxiImageSource:
                     physical_index = column * rows + row
                     offset = physical_index * INDEX_RECORD_SIZE
                     jpeg_length = int(_unpack_from("<I", index_data, offset))
-                    jpeg_offset = int(_unpack_from("<I", index_data, offset + 4))
-                    reserved = int(_unpack_from("<I", index_data, offset + 8))
+                    jpeg_offset = int(_unpack_from("<Q", index_data, offset + 4))
                     if jpeg_offset < HEADER_MIN_SIZE or jpeg_offset + jpeg_length > self._index_offset:
                         raise PunuoxiFormatError(
                             f"IMAGE 第 {len(levels)} 层瓦片 ({column},{row}) 偏移无效"
@@ -264,7 +317,6 @@ class PunuoxiImageSource:
                             row=row,
                             jpeg_length=jpeg_length,
                             jpeg_offset=jpeg_offset,
-                            reserved=reserved,
                         )
                     )
                     tile_index += 1
@@ -297,9 +349,82 @@ class PunuoxiImageSource:
             )
         return levels
 
+    def _first_tile_offset(self) -> int | None:
+        offsets = [
+            record.jpeg_offset
+            for level in self._levels
+            for record in level.records
+            if record.jpeg_length > 0
+        ]
+        return min(offsets) if offsets else None
+
+    def _parse_native_resources(self) -> None:
+        """Parse the raw RGB resources used by the investigated IMAGE files.
+
+        The resource pointers are optional in older/synthetic files. A failed
+        resource probe must not prevent the main JPEG pyramid from being read;
+        callers can then use the legacy preview/associated-image path.
+        """
+
+        if not self._thumbnail_offset or not self._label_offset:
+            return
+        if not (
+            HEADER_MIN_SIZE <= self._thumbnail_offset < self._label_offset < self._index_offset
+        ):
+            self._native_resource_status = "legacy_fallback"
+            self._native_resource_reason = "原生附属图偏移不满足已验证布局"
+            return
+
+        thumbnail_bytes = (
+            self._label_offset
+            - self._thumbnail_offset
+            - NATIVE_MACRO_PIXEL_BYTES
+            - NATIVE_MACRO_TRAILER_BYTES
+        )
+        if thumbnail_bytes <= 0 or thumbnail_bytes % (NATIVE_THUMBNAIL_WIDTH * 3) != 0:
+            self._native_resource_status = "legacy_fallback"
+            self._native_resource_reason = "无法从资源偏移推导 thumbnail 尺寸"
+            return
+        thumbnail_height = thumbnail_bytes // (NATIVE_THUMBNAIL_WIDTH * 3)
+        macro_offset = self._thumbnail_offset + thumbnail_bytes
+        label_pixels_end = self._first_tile_offset()
+        if label_pixels_end is None or label_pixels_end <= self._label_offset:
+            self._native_resource_status = "legacy_fallback"
+            self._native_resource_reason = "无法确定 label 资源结束位置"
+            return
+        label_bytes = label_pixels_end - self._label_offset
+        if label_bytes <= 0 or label_bytes % (NATIVE_LABEL_WIDTH * 3) != 0:
+            self._native_resource_status = "legacy_fallback"
+            self._native_resource_reason = "无法从首个 JPEG 偏移推导 label 尺寸"
+            return
+        label_height = label_bytes // (NATIVE_LABEL_WIDTH * 3)
+        macro_end = macro_offset + NATIVE_MACRO_PIXEL_BYTES + NATIVE_MACRO_TRAILER_BYTES
+        if macro_end != self._label_offset or macro_end > self._file_size:
+            self._native_resource_status = "legacy_fallback"
+            self._native_resource_reason = "imageThumb 宏观图长度不符合已验证布局"
+            return
+
+        self._native_resources = {
+            "thumbnail": (self._thumbnail_offset, NATIVE_THUMBNAIL_WIDTH, thumbnail_height),
+            "macro": (macro_offset, NATIVE_MACRO_WIDTH, NATIVE_MACRO_HEIGHT),
+            "label": (self._label_offset, NATIVE_LABEL_WIDTH, label_height),
+        }
+        self._native_resource_status = "native"
+        self._native_resource_reason = ""
+
+    def _read_rgb_resource(self, name: str) -> Image.Image | None:
+        resource = self._native_resources.get(name)
+        if resource is None:
+            return None
+        offset, width, height = resource
+        size = width * height * 3
+        raw = self._read_at(offset, size)
+        array = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3)).copy()
+        return Image.fromarray(array, mode="RGB")
+
     def _build_base_info(self) -> BaseInfo:
-        mpp_x = self._physical_width_um / self.width
-        mpp_y = self._physical_height_um / self.height
+        mpp_x = self.mpp_x
+        mpp_y = self.mpp_y
         mpp = (mpp_x + mpp_y) / 2.0
         total_tiles = sum(len(level.records) for level in self._levels)
         return BaseInfo(
@@ -376,6 +501,20 @@ class PunuoxiImageSource:
                 self._tile_cache.popitem(last=False)
         return decoded
 
+    def _encoded_level_tile(self, record: PunuoxiTileRecord) -> tuple[bytes | None, str | None]:
+        if record.jpeg_length == 0:
+            return None, None
+        blob = self._read_at(record.jpeg_offset, record.jpeg_length)
+        try:
+            transformed, mode = transpose_jpeg(blob)
+        except Exception as exc:
+            raise PunuoxiFormatError(f"IMAGE JPEG 瓦片方向转换失败: {record.index}") from exc
+        if self._native_tile_mode == "uninitialized":
+            self._native_tile_mode = mode
+        elif self._native_tile_mode != mode:
+            self._native_tile_mode = "mixed"
+        return transformed, mode
+
     def read_region(
         self,
         x: int,
@@ -427,6 +566,64 @@ class PunuoxiImageSource:
                 region[dst_y0:dst_y1, dst_x0:dst_x1] = tile[src_y0:src_y1, src_x0:src_x1]
         return region
 
+    def read_level_region(
+        self,
+        level_index: int,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        if level_index < 0 or level_index >= len(self._levels):
+            raise IndexError(f"IMAGE 金字塔层索引越界: {level_index}")
+        if width <= 0 or height <= 0:
+            return np.empty((max(0, height), max(0, width), 3), dtype=np.uint8)
+
+        level = self._levels[level_index]
+        region = np.full(
+            (height, width, 3),
+            self.base_info.background_color,
+            dtype=np.uint8,
+        )
+        request_x0 = max(0, x)
+        request_y0 = max(0, y)
+        request_x1 = min(level.width, x + width)
+        request_y1 = min(level.height, y + height)
+        if request_x0 >= request_x1 or request_y0 >= request_y1:
+            return region
+
+        first_column = request_x0 // TILE_SIZE
+        last_column = (request_x1 - 1) // TILE_SIZE
+        first_row = request_y0 // TILE_SIZE
+        last_row = (request_y1 - 1) // TILE_SIZE
+        for row in range(first_row, last_row + 1):
+            for column in range(first_column, last_column + 1):
+                record = level.records[row * level.columns + column]
+                tile = self._decode_tile(record)
+                tile_x = column * TILE_SIZE
+                tile_y = row * TILE_SIZE
+                ix0 = max(request_x0, tile_x)
+                iy0 = max(request_y0, tile_y)
+                ix1 = min(request_x1, tile_x + TILE_SIZE)
+                iy1 = min(request_y1, tile_y + TILE_SIZE)
+                src_x0 = ix0 - tile_x
+                src_y0 = iy0 - tile_y
+                src_x1 = src_x0 + ix1 - ix0
+                src_y1 = src_y0 + iy1 - iy0
+                dst_x0 = ix0 - x
+                dst_y0 = iy0 - y
+                dst_x1 = dst_x0 + ix1 - ix0
+                dst_y1 = dst_y0 + iy1 - iy0
+                region[dst_y0:dst_y1, dst_x0:dst_x1] = tile[src_y0:src_y1, src_x0:src_x1]
+        return region
+
+    def iter_native_level_jpegs(self, level_index: int):
+        if level_index < 0 or level_index >= len(self._levels):
+            raise IndexError(f"IMAGE 金字塔层索引越界: {level_index}")
+        for record in self._levels[level_index].records:
+            encoded, _mode = self._encoded_level_tile(record)
+            yield encoded
+
     def _select_preview_level(self, max_long_side: int = 2048) -> PunuoxiLevel:
         for level in self._levels[1:]:
             if max(level.width, level.height) <= max_long_side:
@@ -452,19 +649,28 @@ class PunuoxiImageSource:
         return self._preview_image.copy()
 
     def get_thumbnail_image(self) -> Image.Image | None:
-        if self._thumbnail_image is None:
-            self._thumbnail_image = self.get_preview_image()
+        if self._thumbnail_image is not None:
+            return self._thumbnail_image.copy()
+        native = self._read_rgb_resource("thumbnail")
+        if native is not None:
+            self._thumbnail_image = native
+            return native.copy()
+        self._thumbnail_image = self.get_preview_image()
         return self._thumbnail_image.copy() if self._thumbnail_image is not None else None
 
     def get_label_image(self) -> Image.Image | None:
-        return None
+        if self._label_image is None:
+            self._label_image = self._read_rgb_resource("label")
+        return self._label_image.copy() if self._label_image is not None else None
 
     def get_macro_image(self) -> Image.Image | None:
-        return None
+        if self._macro_image is None:
+            self._macro_image = self._read_rgb_resource("macro")
+        return self._macro_image.copy() if self._macro_image is not None else None
 
     def get_scan_metadata(self) -> dict[str, object]:
-        mpp_x = self._physical_width_um / self.width
-        mpp_y = self._physical_height_um / self.height
+        mpp_x = self.mpp_x
+        mpp_y = self.mpp_y
         return {
             "format": "punuoxi.image",
             "scanTime": self._scan_time,
@@ -480,5 +686,14 @@ class PunuoxiImageSource:
             "height": self.height,
             "levelCount": len(self._levels),
             "levelGrids": self.level_grids,
+            "levelDimensions": self.level_dimensions,
+            "backgroundColor": self.base_info.background_color,
+            "nativeResourceStatus": self._native_resource_status,
+            "nativeResourceReason": self._native_resource_reason,
+            "nativeResources": {
+                name: {"width": value[1], "height": value[2]} if value else None
+                for name, value in self._native_resources.items()
+            },
+            "nativeTileMode": self._native_tile_mode,
             "tailIdentifier": self._tail_identifier,
         }

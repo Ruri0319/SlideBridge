@@ -16,6 +16,7 @@ from .models import BaseInfo
 
 KFB_HEADER_MARKER = b"\xf1\x01\xee\xee"
 KFB_MAGIC = b"KFB\x00"
+KFBF_MAGIC = b"KFBF"
 META_MARKER = b"\xff\x01\xee\xee"
 IMAGE_RECORD_SIZE = 52
 TILE_RECORD_SIZE = 64
@@ -58,6 +59,10 @@ def _i32(data: bytes, offset: int) -> int:
 
 def _f32(data: bytes, offset: int) -> float:
     return struct.unpack_from("<f", data, offset)[0]
+
+
+def _u64(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<Q", data, offset)[0]
 
 
 def _parse_metadata(data: bytes, offset: int, limit: int) -> dict[str, object]:
@@ -166,8 +171,10 @@ class KfbSlideSource:
 
     def _parse_header(self) -> None:
         prefix = self._read_at(0, 0x60)
-        if prefix[:4] != KFB_HEADER_MARKER or prefix[4:8] != KFB_MAGIC:
+        if prefix[:4] != KFB_HEADER_MARKER or prefix[4:8] not in {KFB_MAGIC, KFBF_MAGIC}:
             raise KfbFormatError("不是可识别的 KFB 文件")
+
+        self.container_variant = "kfbf" if prefix[4:8] == KFBF_MAGIC else "kfb"
 
         first_image_record_offset = _u32(prefix, 0x34)
         header_size = max(512, first_image_record_offset)
@@ -237,18 +244,29 @@ class KfbSlideSource:
     def _parse_tile_index(self) -> list[KfbTileRecord]:
         records: list[KfbTileRecord] = []
         with self._lock:
-            self._fh.seek(self.tile_index_offset)
             for index in range(self.tile_count):
-                entry = self._fh.read(TILE_RECORD_SIZE)
-                if len(entry) != TILE_RECORD_SIZE:
-                    raise KfbFormatError("KFB 瓦片索引被截断")
+                entry = self._read_at(
+                    self.tile_index_offset + index * TILE_RECORD_SIZE,
+                    TILE_RECORD_SIZE,
+                )
                 if entry[:4] != b"\xf1\x04\xee\xee" or entry[60:64] != b"\xff\x04\xee\xee":
                     raise KfbFormatError(f"KFB 瓦片记录标记无效: {index}")
 
-                jpeg_size = _i32(entry, 32)
-                jpeg_offset = self.tile_index_offset + _i32(entry, 36)
+                if self.container_variant == "kfbf":
+                    offset_ref = _u32(entry, 36)
+                    size_ref = _u32(entry, 44)
+                    if offset_ref + 8 > self._file_size or size_ref + 8 > self._file_size:
+                        raise KfbFormatError(f"KFBF 瓦片指针无效: {index}")
+                    jpeg_offset = _u64(self._read_at(offset_ref, 8), 0)
+                    jpeg_size = _u64(self._read_at(size_ref, 8), 0)
+                    direct_size = _u32(entry, 32)
+                    if jpeg_size != direct_size:
+                        raise KfbFormatError(f"KFBF 瓦片长度不一致: {index}")
+                else:
+                    jpeg_size = _i32(entry, 32)
+                    jpeg_offset = self.tile_index_offset + _i32(entry, 36)
                 if jpeg_size <= 0 or jpeg_offset < 0 or jpeg_offset + jpeg_size > self._file_size:
-                    raise KfbFormatError(f"KFB 瓦片 JPEG 位置无效: {index}")
+                    raise KfbFormatError(f"{self.container_variant.upper()} 瓦片 JPEG 位置无效: {index}")
 
                 records.append(
                     KfbTileRecord(

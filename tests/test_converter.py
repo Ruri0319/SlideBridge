@@ -43,20 +43,21 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(detect_input_format("a.tif"), "generic_tiff")
         self.assertEqual(detect_input_format("a.tiff"), "generic_tiff")
         self.assertEqual(detect_input_format("a.kfb"), "kfb")
+        self.assertEqual(detect_input_format("a.kfbf"), "kfb")
         self.assertEqual(detect_input_format("a.image"), "image")
         self.assertEqual(detect_input_format("a.txt"), "unsupported")
 
     def test_find_convertible_files_depends_on_output_format(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.image", "f.txt"]:
+            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "f.txt"]:
                 (root / name).write_text("x")
 
             to_svs = find_convertible_files(root, recursive=False, output_format="svs")
             to_tiff = find_convertible_files(root, recursive=False, output_format="generic_tiff")
 
-            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.image"])
-            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.image"])
+            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image"])
+            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.kfbf", "g.image"])
 
     def test_build_output_path_avoids_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

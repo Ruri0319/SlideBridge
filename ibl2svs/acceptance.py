@@ -82,6 +82,61 @@ def compare_preview_geometry(
     }
 
 
+def compare_roi_quality(
+    reference: Image.Image | np.ndarray,
+    candidate: Image.Image | np.ndarray,
+    *,
+    min_psnr: float = 40.0,
+    min_ssim: float = 0.98,
+) -> dict[str, Any]:
+    """Compare two same-size RGB ROIs using PSNR and global SSIM."""
+
+    reference_array = (
+        _image_to_array(reference)
+        if isinstance(reference, Image.Image)
+        else np.asarray(reference, dtype=np.uint8)
+    )
+    candidate_array = (
+        _image_to_array(candidate)
+        if isinstance(candidate, Image.Image)
+        else np.asarray(candidate, dtype=np.uint8)
+    )
+    if reference_array.shape != candidate_array.shape:
+        raise ValueError(
+            f"ROI shapes differ: {reference_array.shape!r} vs {candidate_array.shape!r}"
+        )
+
+    reference_float = reference_array.astype(np.float64)
+    candidate_float = candidate_array.astype(np.float64)
+    error = reference_float - candidate_float
+    mse = float(np.mean(error * error))
+    psnr = float("inf") if mse == 0 else float(10.0 * np.log10((255.0 * 255.0) / mse))
+
+    reference_mean = float(reference_float.mean())
+    candidate_mean = float(candidate_float.mean())
+    reference_variance = float(reference_float.var())
+    candidate_variance = float(candidate_float.var())
+    covariance = float(
+        np.mean((reference_float - reference_mean) * (candidate_float - candidate_mean))
+    )
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    ssim = (
+        (2.0 * reference_mean * candidate_mean + c1)
+        * (2.0 * covariance + c2)
+        / ((reference_mean**2 + candidate_mean**2 + c1)
+           * (reference_variance + candidate_variance + c2))
+    )
+    return {
+        "mse": mse,
+        "psnr": psnr,
+        "ssim": float(ssim),
+        "min_psnr": min_psnr,
+        "min_ssim": min_ssim,
+        "passed": psnr >= min_psnr and ssim >= min_ssim,
+    }
+
+
 def summarize_wsi_output(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     summary: dict[str, Any] = {

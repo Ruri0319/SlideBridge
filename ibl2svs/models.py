@@ -162,6 +162,11 @@ class ConvertResult:
     failure_stage: str | None = None
     error_code: str | None = None
     error: str | None = None
+    native_path: bool = False
+    native_level_dimensions: list[tuple[int, int]] | None = None
+    native_resource_dimensions: dict[str, tuple[int, int] | None] | None = None
+    native_tile_mode: str | None = None
+    native_fallback_reason: str | None = None
 
 
 @dataclass

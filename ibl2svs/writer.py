@@ -13,8 +13,10 @@ from PIL import Image, ImageCms, ImageDraw
 from .app_meta import APP_NAME, APP_VERSION
 from .assembler import (
     DensePyramidDrive,
+    NativeLevelSource,
     PILImageSource,
     ProgressState,
+    ResizedSource,
     StripDownsampleDrive,
     compute_pyramid_shapes,
     iter_source_tiles,
@@ -48,13 +50,38 @@ def _load_tiff_runtime(*, require_imagecodecs: bool = True):
     return tifffile
 
 
+def _is_native_punuoxi(slide) -> bool:
+    return bool(
+        getattr(slide, "supports_native_pyramid", False)
+        and callable(getattr(slide, "iter_native_level_jpegs", None))
+        and callable(getattr(slide, "read_level_region", None))
+    )
+
+
+def _mpp_xy(slide) -> tuple[float, float]:
+    mpp = float(getattr(slide.base_info, "mpp", 0.0) or 0.0)
+    mpp_x = float(getattr(slide, "mpp_x", 0.0) or 0.0)
+    mpp_y = float(getattr(slide, "mpp_y", 0.0) or 0.0)
+    getter = getattr(slide, "get_scan_metadata", None)
+    if callable(getter):
+        try:
+            metadata = getter()
+        except Exception:
+            metadata = {}
+        mpp_x = float(metadata.get("mppX", mpp_x) or mpp_x or mpp)
+        mpp_y = float(metadata.get("mppY", mpp_y) or mpp_y or mpp)
+    return mpp_x or mpp, mpp_y or mpp
+
+
 def build_generic_description(slide: IBLSlide) -> str:
     app_mag = slide.base_info.max_zoom_rate
+    mpp_x, mpp_y = _mpp_xy(slide)
     return (
         f"{APP_NAME} generic pyramidal TIFF | "
         f"OriginalFile={slide.path.name} | "
         f"Width={slide.width} | Height={slide.height} | "
         f"MPP = {slide.base_info.mpp:.6f} | "
+        f"MPP_X = {mpp_x:.6f} | MPP_Y = {mpp_y:.6f} | "
         f"AppMag = {app_mag} | "
         f"ObjectivePower = {app_mag} | "
         f"openslide.objective-power = {app_mag}"
@@ -63,12 +90,14 @@ def build_generic_description(slide: IBLSlide) -> str:
 
 def build_aperio_description(slide: IBLSlide, options: ConvertOptions) -> str:
     tile_size = options.resolved_tile_size()
+    mpp_x, mpp_y = _mpp_xy(slide)
     return (
         "Aperio Image Library v12.0.0 \r\n"
         f"{slide.width}x{slide.height} [0,0 {slide.width}x{slide.height}] "
         f"({tile_size}x{tile_size}) JPEG/RGB Q={options.jpeg_quality}|"
         f"AppMag = {slide.base_info.max_zoom_rate}|"
         f"MPP = {slide.base_info.mpp:.6f}|"
+        f"MPP_X = {mpp_x:.6f}|MPP_Y = {mpp_y:.6f}|"
         f"Filename = {slide.path.stem}|"
         f"OriginalWidth = {slide.width}|"
         f"OriginalHeight = {slide.height}"
@@ -112,17 +141,21 @@ def build_aperio_macro_description(width: int, height: int) -> str:
 def _resolution_kwargs_for_mpp(
     mpp: float,
     *,
+    mpp_x: float | None = None,
+    mpp_y: float | None = None,
     base_width: int,
     base_height: int,
     level_width: int,
     level_height: int,
 ) -> dict[str, Any]:
-    if mpp <= 0:
+    mpp_x = mpp if mpp_x is None else mpp_x
+    mpp_y = mpp if mpp_y is None else mpp_y
+    if mpp_x <= 0 or mpp_y <= 0:
         return {}
     x_downsample = base_width / max(1, level_width)
     y_downsample = base_height / max(1, level_height)
-    x_pixels_per_cm = 10000.0 / (mpp * x_downsample)
-    y_pixels_per_cm = 10000.0 / (mpp * y_downsample)
+    x_pixels_per_cm = 10000.0 / (mpp_x * x_downsample)
+    y_pixels_per_cm = 10000.0 / (mpp_y * y_downsample)
     return {
         "resolution": (x_pixels_per_cm, y_pixels_per_cm),
         "resolutionunit": "CENTIMETER",
@@ -456,6 +489,171 @@ def _compute_svs_pyramid_shapes(slide: IBLSlide, options: ConvertOptions) -> lis
     return shapes
 
 
+def _native_level_for_shape(slide, width: int, height: int) -> int:
+    dimensions = list(getattr(slide, "level_dimensions", []))
+    if not dimensions:
+        return 0
+    return min(
+        range(len(dimensions)),
+        key=lambda index: abs(dimensions[index][0] - width) + abs(dimensions[index][1] - height),
+    )
+
+
+def _native_level_source_for_shape(slide, width: int, height: int):
+    level_index = _native_level_for_shape(slide, width, height)
+    native = NativeLevelSource(slide, level_index)
+    if (native.width, native.height) == (width, height):
+        return native, level_index
+    return ResizedSource(native, width, height), level_index
+
+
+def _native_resource_image(slide, name: str) -> Image.Image | None:
+    if not _is_native_punuoxi(slide) or getattr(slide, "native_resource_status", "") != "native":
+        return None
+    getter = getattr(slide, f"get_{name}_image", None)
+    if not callable(getter):
+        return None
+    return getter()
+
+
+def _write_native_rgb_page(
+    tif,
+    image: Image.Image,
+    *,
+    description: str,
+    subfiletype: int,
+) -> tuple[int, int]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width = array.shape[:2]
+    tif.write(
+        array,
+        photometric="rgb",
+        compression="lzw",
+        rowsperstrip=max(1, min(height, 64)),
+        description=description,
+        metadata=None,
+        software="",
+        subfiletype=subfiletype,
+    )
+    return width, height
+
+
+def _write_generic_native_tiff(
+    slide,
+    output_path: Path,
+    options: ConvertOptions,
+    perf: dict[str, Any],
+    *,
+    progress_callback=None,
+    cancel_event=None,
+) -> int:
+    """Write the vendor's native IMAGE levels without resampling."""
+
+    tifffile = _load_tiff_runtime(require_imagecodecs=True)
+    tile_size = 256
+    levels = list(slide.levels)
+    mpp_x, mpp_y = _mpp_xy(slide)
+    resource_status = getattr(slide, "native_resource_status", "unavailable")
+    aux_names = ("thumbnail", "macro", "label") if resource_status == "native" else ()
+    total_tiles = sum(len(level.records) for level in levels)
+    overall_total = 1 + total_tiles + len(aux_names) + 1
+    overall_done = 1
+    perf["current_stage"] = "解析 IMAGE"
+    perf["native_path"] = True
+    perf["native_level_dimensions"] = list(slide.level_dimensions)
+    perf["native_resource_dimensions"] = dict(getattr(slide, "native_resource_dimensions", {}))
+    perf["native_fallback_reason"] = getattr(slide, "native_resource_reason", "") or None
+    _emit_progress(progress_callback, "解析 IMAGE", 1, 1, overall_done, overall_total)
+
+    blank_tile = _encode_jpeg(
+        np.full((tile_size, tile_size, 3), slide.base_info.background_color, dtype=np.uint8),
+        100,
+    )
+
+    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tif:
+        for level_index, level in enumerate(levels):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("转换已取消")
+
+            def encoded_tiles(level_index=level_index):
+                for tile in slide.iter_native_level_jpegs(level_index):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("转换已取消")
+                    yield blank_tile if tile is None else tile
+
+            width, height = level.dimensions
+            tif.write(
+                data=encoded_tiles(),
+                shape=(height, width, 3),
+                dtype=np.uint8,
+                photometric="rgb",
+                tile=(tile_size, tile_size),
+                compression="jpeg",
+                subsampling=(1, 1),
+                metadata=None,
+                software=f"{APP_NAME} {APP_VERSION}",
+                description=(
+                    build_generic_description(slide)
+                    if level_index == 0
+                    else f"{APP_NAME} native IMAGE level {level_index} | {width}x{height}"
+                ),
+                subfiletype=0 if level_index == 0 else 1,
+                **_resolution_kwargs_for_mpp(
+                    slide.base_info.mpp,
+                    mpp_x=mpp_x,
+                    mpp_y=mpp_y,
+                    base_width=slide.width,
+                    base_height=slide.height,
+                    level_width=width,
+                    level_height=height,
+                ),
+            )
+            overall_done += len(level.records)
+            _emit_progress(
+                progress_callback,
+                "写出原生层",
+                level_index + 1,
+                len(levels),
+                overall_done,
+                overall_total,
+            )
+
+        if resource_status == "native":
+            for name in aux_names:
+                image = _native_resource_image(slide, name)
+                if image is None:
+                    continue
+                width, height = image.size
+                _write_native_rgb_page(
+                    tif,
+                    image,
+                    description=f"{APP_NAME} native {name} {width}x{height}",
+                    subfiletype=9 if name == "macro" else 1,
+                )
+                overall_done += 1
+                _emit_progress(
+                    progress_callback,
+                    "写出原生附属图",
+                    1,
+                    len(aux_names),
+                    overall_done,
+                    overall_total,
+                )
+
+    perf["native_tile_mode"] = getattr(slide, "native_tile_mode", "unknown")
+    perf["level_dimensions"] = list(slide.level_dimensions)
+    perf["max_level_reached"] = max(0, len(levels) - 1)
+    _advance_write_tail_progress(
+        perf,
+        progress_callback,
+        step_done=1,
+        step_total=1,
+        overall_done=overall_total,
+        overall_total=overall_total,
+    )
+    return len(levels)
+
+
 def _build_thumbnail_array(slide: IBLSlide, max_size: int = 1024) -> np.ndarray:
     image = slide.get_thumbnail_image() or slide.get_preview_image()
     if image is None:
@@ -543,9 +741,41 @@ def write_aperio_associated_images(
         "svs_label_dimensions": None,
         "svs_macro_dimensions": None,
     }
-    iccprofile = _get_srgb_icc_profile()
     associated_total = _svs_associated_units(options)
     associated_done = 0
+
+    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+        for name, enabled, subfiletype in (
+            ("label", options.svs_generate_label, 1),
+            ("macro", options.svs_generate_macro, 9),
+        ):
+            if not enabled:
+                continue
+            image = _native_resource_image(slide, name)
+            if image is None:
+                continue
+            perf["current_stage"] = "生成附属图像"
+            started = time.perf_counter()
+            width, height = _write_native_rgb_page(
+                tif,
+                image,
+                description=f"Aperio Image Library v12.0.0 \n{name} {image.width}x{image.height}",
+                subfiletype=subfiletype,
+            )
+            perf["thumbnail_sec"] += time.perf_counter() - started
+            metadata[f"svs_{name}_dimensions"] = (width, height)
+            associated_done += 1
+            _emit_progress(
+                progress_callback,
+                "生成附属图像",
+                associated_done,
+                max(1, associated_total),
+                overall_done + associated_done,
+                overall_total,
+            )
+        return metadata
+
+    iccprofile = _get_srgb_icc_profile()
 
     macro_array = _build_macro_array(slide) if options.svs_generate_macro else None
 
@@ -639,6 +869,18 @@ def write_aperio_thumbnail_page(
 ) -> int:
     perf["current_stage"] = "生成缩略图"
     thumb_started = time.perf_counter()
+    native = _native_resource_image(slide, "thumbnail")
+    if native is not None:
+        _write_native_rgb_page(
+            tif,
+            native,
+            description=f"Aperio Image Library v12.0.0 \nthumbnail {native.width}x{native.height}",
+            subfiletype=1,
+        )
+        perf["thumbnail_sec"] += time.perf_counter() - thumb_started
+        _emit_progress(progress_callback, "生成缩略图", 1, 1, overall_done + 1, overall_total)
+        return 1
+
     thumbnail = _build_thumbnail_array(slide, max_size=thumbnail_max)
     h, w = thumbnail.shape[:2]
     tables, stripped = _encode_jpeg_stripped(thumbnail, options.jpeg_quality)
@@ -662,6 +904,148 @@ def write_aperio_thumbnail_page(
     return 1
 
 
+def _write_svs_native_streaming(
+    slide,
+    output_path: Path,
+    options: ConvertOptions,
+    perf: dict[str, Any],
+    *,
+    progress_callback=None,
+    cancel_event=None,
+) -> tuple[str, int, int]:
+    tifffile = _load_tiff_runtime(require_imagecodecs=True)
+    layout = build_aperio_svs_layout(slide, options)
+    desired_levels = layout["pyramid"]
+    tile_size = options.resolved_tile_size()
+    parallel = _resolve_parallel_settings(options)
+    bigtiff = bool(layout["bigtiff"])
+    quality = options.jpeg_quality
+    associated_units = _svs_associated_units(options)
+    write_tail_total = _svs_write_tail_units(options)
+    level_tiles = [tile_count(width, height, tile_size) for width, height in desired_levels]
+    main_tiles = tile_count(slide.width, slide.height, tile_size)
+    overall_total = 1 + main_tiles + 1 + sum(level_tiles) + associated_units + write_tail_total
+    overall_done = 1
+
+    perf["native_path"] = True
+    perf["native_level_dimensions"] = list(slide.level_dimensions)
+    perf["native_resource_dimensions"] = dict(getattr(slide, "native_resource_dimensions", {}))
+    perf["native_fallback_reason"] = getattr(slide, "native_resource_reason", "") or None
+    perf["level_dimensions"] = [(slide.width, slide.height), *desired_levels]
+    perf["svs_is_bigtiff"] = bigtiff
+    perf["current_stage"] = "解析 IMAGE"
+    _emit_progress(progress_callback, "解析 IMAGE", 1, 1, overall_done, overall_total)
+
+    common = _svs_common_kwargs(options)
+    iccprofile = _get_srgb_icc_profile()
+    strip_height = max(tile_size, min(parallel["chunk_size"], tile_size * 2))
+    strip_height = max(tile_size, (strip_height // tile_size) * tile_size)
+
+    with tifffile.TiffWriter(str(output_path), bigtiff=bigtiff) as tif:
+        main_source = NativeLevelSource(slide, 0)
+        main_progress = ProgressState()
+        main_iter = iter_source_tiles(
+            main_source,
+            tile_size,
+            chunk_size=strip_height,
+            progress=main_progress,
+            cancel_event=cancel_event,
+            notify=lambda state: _emit_progress(
+                progress_callback,
+                "构建主图",
+                state.done,
+                state.total,
+                overall_done + state.done,
+                overall_total,
+            ),
+        )
+        started = time.perf_counter()
+        tif.write(
+            data=iter(_EncodedTileIter(main_iter, quality)),
+            shape=(slide.height, slide.width, 3),
+            description=build_aperio_description(slide, options),
+            software="",
+            iccprofile=iccprofile,
+            subfiletype=0,
+            jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+            **common,
+        )
+        perf["main_write_sec"] += time.perf_counter() - started
+        overall_done += main_tiles
+
+        overall_done += write_aperio_thumbnail_page(
+            tif,
+            slide,
+            options,
+            perf,
+            iccprofile=iccprofile,
+            overall_done=overall_done,
+            overall_total=overall_total,
+            thumbnail_max=layout["thumbnail_max"],
+            progress_callback=progress_callback,
+        )
+
+        for level_index, ((width, height), level_tile_count) in enumerate(zip(desired_levels, level_tiles), start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("转换已取消")
+            level_source, native_index = _native_level_source_for_shape(slide, width, height)
+            level_progress = ProgressState()
+            level_iter = iter_source_tiles(
+                level_source,
+                tile_size,
+                chunk_size=strip_height,
+                progress=level_progress,
+                cancel_event=cancel_event,
+                notify=lambda state, offset=overall_done: _emit_progress(
+                    progress_callback,
+                    "生成金字塔",
+                    state.done,
+                    state.total,
+                    offset + state.done,
+                    overall_total,
+                ),
+            )
+            started = time.perf_counter()
+            tif.write(
+                data=iter(_EncodedTileIter(level_iter, quality)),
+                shape=(height, width, 3),
+                description=(
+                    build_aperio_pyramid_description(slide, options, width, height)
+                    + f"|NativeLevel = {native_index}"
+                ),
+                software="",
+                iccprofile=iccprofile,
+                subfiletype=0,
+                jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+                **common,
+            )
+            perf["pyramid_sec"] += time.perf_counter() - started
+            overall_done += level_tile_count
+
+        associated = write_aperio_associated_images(
+            tif,
+            slide,
+            options,
+            perf,
+            overall_done=overall_done,
+            overall_total=overall_total,
+            progress_callback=progress_callback,
+        )
+        perf.update({key: value for key, value in associated.items() if value is not None})
+
+    perf["native_tile_mode"] = "reencoded"
+    completed = overall_done + associated_units + 1
+    _advance_write_tail_progress(
+        perf,
+        progress_callback,
+        step_done=1,
+        step_total=write_tail_total,
+        overall_done=completed,
+        overall_total=overall_total,
+    )
+    return "svs-native-streaming", completed, overall_total
+
+
 def _write_generic_tiff_streaming(
     slide: IBLSlide,
     output_path: Path,
@@ -679,6 +1063,16 @@ def _write_generic_tiff_streaming(
     further pyramid level is generated by cascading (resize → write) from
     that buffer, giving per-tile progress for every level.
     """
+    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+        return _write_generic_native_tiff(
+            slide,
+            output_path,
+            options,
+            perf,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
     tile_size = options.resolved_tile_size()
     parallel = _resolve_parallel_settings(options)
@@ -871,6 +1265,16 @@ def _write_svs_streaming_direct(
     The 8× pyramid level is generated in-memory from the completed 4×
     buffer.  No pyvips/libvips or intermediate temporary files needed.
     """
+    if _is_native_punuoxi(slide) and getattr(slide, "native_resource_status", "") == "native":
+        return _write_svs_native_streaming(
+            slide,
+            output_path,
+            options,
+            perf,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
     layout = build_aperio_svs_layout(slide, options)
     desired_levels = layout["pyramid"]
@@ -1086,9 +1490,16 @@ def write_image(
         "svs_photometric_pages": None,
         "openslide_vendor": None,
         "max_level_reached": None,
+        "native_path": False,
+        "native_level_dimensions": None,
+        "native_resource_dimensions": None,
+        "native_tile_mode": None,
+        "native_fallback_reason": None,
         "failure_stage": None,
         **parallel,
     }
+    if getattr(slide, "native_resource_status", "") == "legacy_fallback":
+        perf["native_fallback_reason"] = getattr(slide, "native_resource_reason", "") or None
 
     try:
         if options.output_format == "generic_tiff":

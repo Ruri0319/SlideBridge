@@ -20,6 +20,7 @@ class PILImageSource:
         self.image = image.convert("RGB")
         self.width, self.height = self.image.size
         self.channels = 3
+        self.background_color = 255
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -42,6 +43,7 @@ class SlideSource:
         self.width = slide.width
         self.height = slide.height
         self.channels = 3
+        self.background_color = int(getattr(slide.base_info, "background_color", 255))
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -58,6 +60,7 @@ class PyramidSource:
         self.width = max(1, (source.width + downsample - 1) // downsample)
         self.height = max(1, (source.height + downsample - 1) // downsample)
         self.channels = 3
+        self.background_color = getattr(source, "background_color", 255)
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -75,6 +78,60 @@ class PyramidSource:
         return np.array(resized, dtype=np.uint8)
 
 
+class NativeLevelSource:
+    """Expose one native pyramid level through the regular region interface."""
+
+    def __init__(self, slide, level_index: int):
+        self.slide = slide
+        self.level_index = level_index
+        self.width, self.height = slide.level_dimensions[level_index]
+        self.channels = 3
+        self.background_color = int(getattr(slide.base_info, "background_color", 255))
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, self.channels)
+
+    def read_region(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        return self.slide.read_level_region(self.level_index, x, y, width, height)
+
+
+class ResizedSource:
+    """Stream a source at a different canvas size without materializing it."""
+
+    def __init__(self, source, width: int, height: int):
+        self.source = source
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        self.channels = 3
+        self.background_color = getattr(source, "background_color", 255)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, self.channels)
+
+    def read_region(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        if width <= 0 or height <= 0:
+            return np.empty((max(0, height), max(0, width), 3), dtype=np.uint8)
+
+        sx0 = (max(0, x) * self.source.width) // self.width
+        sy0 = (max(0, y) * self.source.height) // self.height
+        sx1 = min(
+            self.source.width,
+            max(sx0 + 1, ((max(0, x) + width) * self.source.width + self.width - 1) // self.width),
+        )
+        sy1 = min(
+            self.source.height,
+            max(sy0 + 1, ((max(0, y) + height) * self.source.height + self.height - 1) // self.height),
+        )
+        source_region = self.source.read_region(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        resized = Image.fromarray(source_region).resize(
+            (width, height),
+            resample=Image.Resampling.BILINEAR,
+        )
+        return np.asarray(resized, dtype=np.uint8)
+
+
 def tile_count(width: int, height: int, tile_size: int) -> int:
     tiles_x = (width + tile_size - 1) // tile_size
     tiles_y = (height + tile_size - 1) // tile_size
@@ -87,6 +144,7 @@ def _emit_tiles_from_region(
     region_height: int,
     tile_size: int,
     progress: ProgressState | None,
+    fill_value: int = 255,
 ):
     for tile_y in range(0, region_height, tile_size):
         tile_h = min(tile_size, region_height - tile_y)
@@ -94,7 +152,7 @@ def _emit_tiles_from_region(
             tile_w = min(tile_size, region_width - tile_x)
             tile = region[tile_y : tile_y + tile_h, tile_x : tile_x + tile_w]
             if tile_h != tile_size or tile_w != tile_size:
-                padded = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
+                padded = np.full((tile_size, tile_size, 3), fill_value, dtype=np.uint8)
                 padded[:tile_h, :tile_w] = tile
                 tile = padded
             else:
@@ -140,7 +198,14 @@ def _iter_chunk_tiles(
         if memory_tracker is not None:
             memory_tracker.sample()
 
-        yield from _emit_tiles_from_region(region, source.width, strip_h, tile_size, progress)
+        yield from _emit_tiles_from_region(
+            region,
+            source.width,
+            strip_h,
+            tile_size,
+            progress,
+            fill_value=getattr(source, "background_color", 255),
+        )
 
         if notify is not None and progress is not None:
             notify(progress)
@@ -259,7 +324,11 @@ class StripDownsampleDrive:
                     tw = min(tile_size, w - tx)
                     tile = region[ty : ty + th, tx : tx + tw]
                     if th != tile_size or tw != tile_size:
-                        padded = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
+                        padded = np.full(
+                            (tile_size, tile_size, 3),
+                            self._slide.base_info.background_color,
+                            dtype=np.uint8,
+                        )
                         padded[:th, :tw] = tile
                         tile = padded
                     else:
@@ -363,7 +432,11 @@ class DensePyramidDrive:
                     tw = min(tile_size, w - tx)
                     tile = region[ty : ty + th, tx : tx + tw]
                     if th != tile_size or tw != tile_size:
-                        padded = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
+                        padded = np.full(
+                            (tile_size, tile_size, 3),
+                            self._slide.base_info.background_color,
+                            dtype=np.uint8,
+                        )
                         padded[:th, :tw] = tile
                         tile = padded
                     else:

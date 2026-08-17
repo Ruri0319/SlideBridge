@@ -12,6 +12,22 @@ from tests.support import create_sample_image
 
 
 class PunuoxiImageSourceTests(unittest.TestCase):
+    def test_real_vendor_samples_expose_native_resources_and_levels(self) -> None:
+        samples = [Path(__file__).resolve().parents[1] / "punuoxi" / name for name in ("6.image", "8.image")]
+        if not all(path.exists() for path in samples):
+            self.skipTest("real Punuoxi samples are not available")
+
+        for path in samples:
+            with PunuoxiImageSource(path) as source:
+                self.assertEqual(source.native_resource_status, "native")
+                self.assertEqual(len(source.levels), 8)
+                self.assertEqual(source.get_macro_image().size, (1152, 625))
+                self.assertEqual(source.get_label_image().size, (300, 294))
+                self.assertEqual(source.get_thumbnail_image().width, 300)
+                for level_index in range(len(source.levels)):
+                    tile = next(tile for tile in source.iter_native_level_jpegs(level_index) if tile is not None)
+                    self.assertGreater(len(tile), 4)
+
     def test_reads_image_without_memory_mapping_the_file(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.image"
@@ -41,6 +57,38 @@ class PunuoxiImageSourceTests(unittest.TestCase):
             self.assertEqual(metadata["caseNo"], "CASE-001")
             self.assertEqual(metadata["deviceNo"], "TEST-PUNUOXI")
             self.assertEqual(metadata["scanTime"], "2026-01-01 12:34:56")
+
+    def test_reads_native_rgb_resources_and_native_level_jpegs(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "native.image"
+            create_sample_image(path, include_native_resources=True)
+
+            with PunuoxiImageSource(path) as source:
+                self.assertEqual(source.native_resource_status, "native")
+                self.assertEqual(source.get_thumbnail_image().size, (300, 5))
+                self.assertEqual(source.get_macro_image().size, (1152, 625))
+                self.assertEqual(source.get_label_image().size, (300, 294))
+                self.assertEqual(source.get_thumbnail_image().getpixel((0, 0)), (10, 20, 30))
+                self.assertEqual(source.get_macro_image().getpixel((0, 0)), (40, 50, 60))
+                self.assertEqual(source.get_label_image().getpixel((0, 0)), (70, 80, 90))
+                native_tiles = list(source.iter_native_level_jpegs(0))
+
+            self.assertEqual(len(native_tiles), 4)
+            self.assertTrue(all(tile is not None for tile in native_tiles))
+
+    def test_invalid_native_resource_pointers_use_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "fallback.image"
+            create_sample_image(path)
+            data = bytearray(path.read_bytes())
+            data[0:8] = (200).to_bytes(8, "little")
+            data[8:16] = (100).to_bytes(8, "little")
+            path.write_bytes(data)
+
+            with PunuoxiImageSource(path) as source:
+                self.assertEqual(source.native_resource_status, "legacy_fallback")
+                self.assertIn("偏移", source.native_resource_reason)
+                self.assertIsNotNone(source.get_preview_image())
 
     def test_reads_region_across_tiles_and_pads_outside(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

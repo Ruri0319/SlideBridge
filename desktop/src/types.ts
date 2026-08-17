@@ -39,6 +39,11 @@ export interface ConvertResultPayload {
   mpp: number | null;
   duration_sec: number;
   peak_memory_mb: number;
+  native_path: boolean;
+  native_level_dimensions: [number, number][] | null;
+  native_resource_dimensions: Record<string, [number, number] | null> | null;
+  native_tile_mode: string | null;
+  native_fallback_reason: string | null;
   failure_stage: string | null;
   error_code: string | null;
   error: string | null;

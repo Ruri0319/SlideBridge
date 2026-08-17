@@ -1,5 +1,12 @@
 # Release Notes
 
+## Unreleased
+
+- `.image` 原生保真转换：支持 64 位瓦片偏移、原生 8 级金字塔以及 thumbnail、macro、label RGB 资源。
+- Generic TIFF 保留原生 256×256 JPEG 瓦片和无损附属页；SVS 从厂家金字塔层独立生成兼容页面。
+- 增加 JPEG DCT 域无损轴转置路径；缺少 `jpegtran` 时自动使用高质量重编码并记录转换模式。
+- 支持 KFBF（`.kfbf`）切片变体：识别 `KFBF` 文件头和间接 JPEG 瓦片指针。
+
 ## 0.4.5
 
 - 隐藏 Windows 正式版启动时附带的空白命令窗口，关闭应用不再依赖控制台窗口。

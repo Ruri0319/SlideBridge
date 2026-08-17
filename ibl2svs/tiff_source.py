@@ -344,6 +344,14 @@ class TiffSlideSource:
             desc = (page.description or "").lower()
             if "label " in desc or "macro " in desc:
                 continue
+            if ("thumbnail " in desc or "native thumbnail" in desc) and not getattr(page, "is_tiled", False):
+                image = self._page_to_image(page)
+                if image is not None:
+                    return image.convert("RGB")
+        for page in self._tif.pages[1:]:
+            desc = (page.description or "").lower()
+            if "label " in desc or "macro " in desc:
+                continue
             if not getattr(page, "is_tiled", False):
                 image = self._page_to_image(page)
                 if image is not None:
@@ -354,6 +362,16 @@ class TiffSlideSource:
         for page in self._tif.pages[1:]:
             desc = (page.description or "").lower()
             if "label " not in desc:
+                continue
+            image = self._page_to_image(page)
+            if image is not None:
+                return image.convert("RGB")
+        return None
+
+    def get_macro_image(self) -> Image.Image | None:
+        for page in self._tif.pages[1:]:
+            desc = (page.description or "").lower()
+            if "macro " not in desc and "native macro" not in desc:
                 continue
             image = self._page_to_image(page)
             if image is not None:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from ibl2svs.acceptance import compare_preview_geometry, summarize_wsi_output
+from ibl2svs.acceptance import compare_preview_geometry, compare_roi_quality, summarize_wsi_output
 from ibl2svs.converter import convert_file
 from ibl2svs.models import ConvertOptions
 from ibl2svs.reader import IBLSlide
@@ -31,6 +31,16 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertAlmostEqual(result["iou"], 1.0)
         self.assertAlmostEqual(result["xor_ratio"], 0.0)
+
+    def test_compare_roi_quality_passes_for_identical_roi(self) -> None:
+        image = Image.new("RGB", (8, 8), (120, 10, 10))
+
+        result = compare_roi_quality(image, image)
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["mse"], 0.0)
+        self.assertEqual(result["psnr"], float("inf"))
+        self.assertAlmostEqual(result["ssim"], 1.0)
 
     def test_debug_export_roi_writes_file(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -25,6 +25,9 @@ hiddenimports = sorted(
 
 binaries = collect_dynamic_libs("imagecodecs") + collect_dynamic_libs("pyvips")
 datas = collect_data_files("tifffile") + [("README.txt", ".")]
+for jpegtran_path in (ROOT / "ibl2svs" / "jpegtran.exe", ROOT / "ibl2svs" / "jpegtran"):
+    if jpegtran_path.is_file():
+        datas.append((str(jpegtran_path), "ibl2svs"))
 
 a = Analysis(
     ["worker_main.py"],
