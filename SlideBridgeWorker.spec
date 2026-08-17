@@ -10,20 +10,18 @@ ROOT = Path.cwd()
 hiddenimports = sorted(
     set(
         collect_submodules("PIL")
-        + collect_submodules("tifffile")
         + collect_submodules("imagecodecs")
-        + collect_submodules("pyvips")
         + [
             "numpy",
             "numpy.core",
             "numpy._core",
             "psutil",
-            "pyvips",
+            "tifffile",
         ]
     )
 )
 
-binaries = collect_dynamic_libs("imagecodecs") + collect_dynamic_libs("pyvips")
+binaries = collect_dynamic_libs("imagecodecs")
 datas = collect_data_files("tifffile") + [("README.txt", ".")]
 for jpegtran_path in (ROOT / "ibl2svs" / "jpegtran.exe", ROOT / "ibl2svs" / "jpegtran"):
     if jpegtran_path.is_file():
@@ -38,7 +36,19 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "ttkbootstrap"],
+    excludes=[
+        "IPython",
+        "lxml",
+        "matplotlib",
+        "pandas",
+        "pyvips",
+        "pytest",
+        "scipy",
+        "torch",
+        "zarr",
+        "tkinter",
+        "ttkbootstrap",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

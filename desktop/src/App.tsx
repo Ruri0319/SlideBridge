@@ -16,6 +16,7 @@ import {
   onConversionEvent,
   openFilesystemPath,
   startConversion,
+  startInspection,
 } from "./tauriApi";
 import {
   defaultConversionSettings,
@@ -26,8 +27,11 @@ import {
 import { defaultThemeSettings, loadThemeSettings, resolveTheme, saveThemeSettings } from "./theme";
 import type {
   ActualTheme,
+  BatchInspection,
+  ChannelDefinition,
   ConversionSettings,
   ConversionEvent,
+  InputInspection,
   OutputFormat,
   ProgressState,
   ThemeSettings,
@@ -165,7 +169,7 @@ export default function App() {
   const [view, setView] = useState<ViewKey>("new");
   const [inputDir, setInputDir] = useState("");
   const [outputDir, setOutputDir] = useState("");
-  const [outputFormat, setOutputFormat] = useState<OutputFormat>("generic_tiff");
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("ome_tiff");
   const [recursive, setRecursive] = useState(true);
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [phaseStates, setPhaseStates] = useState<PhaseDisplayState[]>(() => initialPhaseStates());
@@ -175,7 +179,13 @@ export default function App() {
   const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
   const [appVersion, setAppVersion] = useState("0.4.5");
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
+  const [inspection, setInspection] = useState<BatchInspection | null>(null);
+  const [inspectionStatus, setInspectionStatus] = useState<"idle" | "running" | "ready" | "error">("idle");
+  const [inspectionMessage, setInspectionMessage] = useState("");
+  const [dialog, setDialog] = useState<"channels" | "compatibility" | null>(null);
+  const [pendingOverrides, setPendingOverrides] = useState<Record<string, ChannelDefinition[]>>({});
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
+  const inspectionJob = useRef("");
   const fileProgressByPath = useRef<Map<string, number>>(new Map());
   const filePhaseByPath = useRef<Map<string, number>>(new Map());
   const completedFiles = useRef<Set<string>>(new Set());
@@ -212,6 +222,28 @@ export default function App() {
       if (unsubscribe) unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    if (!inputDir) {
+      setInspection(null);
+      setInspectionStatus("idle");
+      setInspectionMessage("");
+      return;
+    }
+    const jobId = `inspect-${Date.now()}`;
+    inspectionJob.current = jobId;
+    setInspection(null);
+    setInspectionStatus("running");
+    setInspectionMessage("正在读取文件头…");
+    const timer = window.setTimeout(() => {
+      void startInspection({ job_id: jobId, input_dir: inputDir, recursive }).catch((error) => {
+        if (inspectionJob.current !== jobId) return;
+        setInspectionStatus("error");
+        setInspectionMessage(error instanceof Error ? error.message : String(error));
+      });
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [inputDir, recursive]);
 
   function appendLog(message: string) {
     setLogs((items) => [...items.slice(-299), message]);
@@ -257,6 +289,32 @@ export default function App() {
   }
 
   function handleConversionEvent(event: ConversionEvent) {
+    if (event.type === "inspection_started") {
+      if (event.job_id === inspectionJob.current) setInspectionStatus("running");
+      return;
+    }
+    if (event.type === "inspection_progress") {
+      if (event.job_id !== inspectionJob.current) return;
+      setInspectionMessage(
+        event.total > 0
+          ? `正在预检 ${event.done}/${event.total} · ${basename(event.current)}`
+          : "正在扫描输入目录…",
+      );
+      return;
+    }
+    if (event.type === "inspection_done") {
+      if (event.job_id !== inspectionJob.current) return;
+      setInspection(event.inspection);
+      setInspectionStatus("ready");
+      setInspectionMessage(`已预检 ${event.inspection.files.length} 个文件`);
+      return;
+    }
+    if (event.type === "inspection_error") {
+      if (event.job_id && event.job_id !== inspectionJob.current) return;
+      setInspectionStatus("error");
+      setInspectionMessage(event.message);
+      return;
+    }
     if (event.type === "ready") {
       appendLog(event.banner || "Python worker ready");
       return;
@@ -378,6 +436,9 @@ export default function App() {
       batchCancelled.current = false;
       setProgress((state) => ({ ...state, running: false, statusText: "Error", currentPhase: "完成", etaText: "—" }));
       appendLog(event.traceback || event.message);
+      if (event.diagnostic_code) {
+        appendLog(`${event.diagnostic_code} · ${event.diagnostic_stage || "unknown"}`);
+      }
       return;
     }
     if (event.type === "worker_terminated") {
@@ -409,8 +470,25 @@ export default function App() {
     setProgress((state) => ({ ...state, outputDir: path }));
   }
 
-  async function runConversion() {
-    if (!inputDir || !outputDir || progress.running) return;
+  function incompatibleFiles(): number {
+    if (!inspection) return 0;
+    return inspection.files.filter(
+      (file) => Boolean(file.error) || !file.allowed_output_formats.includes(outputFormat),
+    ).length;
+  }
+
+  function unknownChannelFiles() {
+    return (inspection?.files || []).filter(
+      (file) => file.source_modality === "fluorescence"
+        && file.channel_definitions.some((channel) => channel.identity_source === "unknown"),
+    );
+  }
+
+  async function beginConversion(
+    convertCompatibleOnly: boolean,
+    channelOverrides: Record<string, ChannelDefinition[]>,
+  ) {
+    if (!inputDir || !outputDir || progress.running || !inspection) return;
     const jobId = `job-${Date.now()}`;
     const settingsSnapshot = { ...conversionSettings };
     resetBatchAggregation();
@@ -423,7 +501,13 @@ export default function App() {
       currentFile: basename(inputDir),
       outputDir,
       startedAt: Date.now(),
-      backend: outputFormat === "svs" ? "svs-streaming-direct" : "tifffile-streaming",
+      backend: outputFormat === "svs"
+        ? "svs-streaming-direct"
+        : outputFormat === "fluorescence_svs"
+          ? "tifffile-fluorescence-svs"
+          : outputFormat === "afi"
+            ? "tifffile-afi"
+            : "tifffile-ome",
     });
     try {
       await startConversion({
@@ -436,11 +520,48 @@ export default function App() {
         tile_size: 256,
         jpeg_quality: settingsSnapshot.jpeg_quality,
         parallel_wsi: settingsSnapshot.parallel_wsi,
+        selected_input_paths: inspection.files.map((file) => file.input_path),
+        convert_compatible_only: convertCompatibleOnly,
+        channel_overrides: channelOverrides,
+        input_signatures: Object.fromEntries(
+          inspection.files.map((file) => [
+            file.input_path,
+            { size: file.file_size, mtime_ns: file.file_mtime_ns },
+          ]),
+        ),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setProgress((state) => ({ ...state, running: false, statusText: "Error" }));
       appendLog(message);
+    }
+  }
+
+  function runConversion() {
+    if (!inspection || inspectionStatus !== "ready") return;
+    setPendingOverrides({});
+    if (unknownChannelFiles().length > 0) {
+      setDialog("channels");
+      return;
+    }
+    if (incompatibleFiles() > 0) {
+      setDialog("compatibility");
+      return;
+    }
+    void beginConversion(false, {});
+  }
+
+  function editChannels() {
+    if (inspection) setDialog("channels");
+  }
+
+  function acceptChannels(overrides: Record<string, ChannelDefinition[]>) {
+    setPendingOverrides(overrides);
+    setDialog(null);
+    if (incompatibleFiles() > 0) {
+      setDialog("compatibility");
+    } else {
+      void beginConversion(false, overrides);
     }
   }
 
@@ -454,6 +575,8 @@ export default function App() {
     resetBatchAggregation();
     setLogs([]);
     setTaskSettings(null);
+    setDialog(null);
+    setPendingOverrides({});
     setProgress({
       ...initialProgress,
       currentFile: inputDir ? basename(inputDir) : initialProgress.currentFile,
@@ -481,7 +604,19 @@ export default function App() {
     }
   }
 
-  const canStart = Boolean(inputDir && outputDir && !progress.running);
+  const formatCounts: Record<OutputFormat, number> = {
+    ome_tiff: inspection?.files.filter((file) => file.allowed_output_formats.includes("ome_tiff")).length || 0,
+    svs: inspection?.files.filter((file) => file.allowed_output_formats.includes("svs")).length || 0,
+    fluorescence_svs: inspection?.files.filter((file) => file.allowed_output_formats.includes("fluorescence_svs")).length || 0,
+    afi: inspection?.files.filter((file) => file.allowed_output_formats.includes("afi")).length || 0,
+  };
+  const canStart = Boolean(
+    inputDir
+    && outputDir
+    && !progress.running
+    && inspectionStatus === "ready"
+    && formatCounts[outputFormat] > 0,
+  );
 
   return (
     <div className="app-shell">
@@ -563,6 +698,10 @@ export default function App() {
             canStart={canStart}
             running={progress.running}
             reportPath={progress.reportPath}
+            inspection={inspection}
+            inspectionStatus={inspectionStatus}
+            inspectionMessage={inspectionMessage}
+            formatCounts={formatCounts}
             onInput={pickInput}
             onOutput={pickOutput}
             onFormat={setOutputFormat}
@@ -570,11 +709,31 @@ export default function App() {
             onStart={runConversion}
             onCancel={cancelCurrent}
             onReset={resetTask}
+            onEditChannels={editChannels}
             onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
             onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
           />
         )}
       </main>
+      {dialog === "channels" && inspection && (
+        <ChannelDialog
+          files={inspection.files}
+          onCancel={() => setDialog(null)}
+          onContinue={acceptChannels}
+        />
+      )}
+      {dialog === "compatibility" && inspection && (
+        <CompatibilityDialog
+          incompatibleCount={incompatibleFiles()}
+          compatibleCount={formatCounts[outputFormat]}
+          outputFormat={outputFormat}
+          onBack={() => setDialog(null)}
+          onContinue={() => {
+            setDialog(null);
+            void beginConversion(true, pendingOverrides);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -689,6 +848,10 @@ function TaskComposer({
   canStart,
   running,
   reportPath,
+  inspection,
+  inspectionStatus,
+  inspectionMessage,
+  formatCounts,
   onInput,
   onOutput,
   onFormat,
@@ -696,6 +859,7 @@ function TaskComposer({
   onStart,
   onCancel,
   onReset,
+  onEditChannels,
   onOpenOutput,
   onOpenReport,
 }: {
@@ -707,6 +871,10 @@ function TaskComposer({
   canStart: boolean;
   running: boolean;
   reportPath: string;
+  inspection: BatchInspection | null;
+  inspectionStatus: "idle" | "running" | "ready" | "error";
+  inspectionMessage: string;
+  formatCounts: Record<OutputFormat, number>;
   onInput: () => void;
   onOutput: () => void;
   onFormat: (format: OutputFormat) => void;
@@ -714,33 +882,49 @@ function TaskComposer({
   onStart: () => void;
   onCancel: () => void;
   onReset: () => void;
+  onEditChannels: () => void;
   onOpenOutput: () => void;
   onOpenReport: () => void;
 }) {
   return (
     <section className="composer">
       <div className="path-row">
-        <PathButton label="输入目录" value={inputDir || "选择包含 IBL / KFB / IMAGE / SVS / TIFF 的文件夹"} onClick={onInput} />
-        <PathButton label="输出目录" value={outputDir || "选择转换结果保存位置"} onClick={onOutput} />
+        <PathButton label="输入目录" value={inputDir || "选择包含 IBL / KFB / IMAGE / SVS / TIFF / AFI 的文件夹"} onClick={onInput} disabled={running} />
+        <PathButton label="输出目录" value={outputDir || "选择转换结果保存位置"} onClick={onOutput} disabled={running} />
       </div>
       <div className="format-note" aria-label="支持的输入格式">
         <span className="format-note-label">输入格式</span>
         <span className="format-note-values">
-          .ibl · .kfb/.kfbl/.kfbf/.kfba/.kfbx · <strong>.image</strong> · .svs · .tif/.tiff
+          .ibl · .kfb/.kfbl/.kfbf/.kfba/.kfbx · <strong>.image</strong> · .svs · .tif/.tiff · .afi
         </span>
         <span className="format-note-auto">自动识别</span>
       </div>
+      <InspectionSummary
+        inspection={inspection}
+        status={inspectionStatus}
+        message={inspectionMessage}
+      />
       <div className="action-row">
-        <div className="segment">
-          <button className={outputFormat === "generic_tiff" ? "selected" : ""} onClick={() => onFormat("generic_tiff")}>
-            Generic TIFF
-          </button>
-          <button className={outputFormat === "svs" ? "selected" : ""} onClick={() => onFormat("svs")}>
-            SVS
-          </button>
+        <div className="segment format-segment">
+          {([
+            ["ome_tiff", "Pyramidal OME-TIFF"],
+            ["svs", "明场 SVS"],
+            ["fluorescence_svs", "荧光 SVS"],
+            ["afi", "AFI"],
+          ] as [OutputFormat, string][]).map(([format, label]) => (
+            <button
+              key={format}
+              className={outputFormat === format ? "selected" : ""}
+              disabled={inspectionStatus === "ready" && formatCounts[format] === 0}
+              onClick={() => onFormat(format)}
+            >
+              {label}
+              {inspectionStatus === "ready" && <small>{formatCounts[format]}/{inspection?.files.length || 0}</small>}
+            </button>
+          ))}
         </div>
         <label className="check-row">
-          <input type="checkbox" checked={recursive} onChange={(event) => onRecursive(event.target.checked)} />
+          <input type="checkbox" checked={recursive} disabled={running} onChange={(event) => onRecursive(event.target.checked)} />
           包含子文件夹
         </label>
         <button className="primary" disabled={!canStart} onClick={onStart}>
@@ -754,6 +938,9 @@ function TaskComposer({
         <button className="soft" disabled={running} onClick={onReset}>
           <RotateCcw size={14} />
           重置任务
+        </button>
+        <button className="soft" disabled={running || !inspection?.files.some((file) => file.source_modality === "fluorescence")} onClick={onEditChannels}>
+          编辑通道
         </button>
         <button className="ghost" disabled={!outputDir} onClick={onOpenOutput}>
           打开输出
@@ -769,9 +956,253 @@ function TaskComposer({
   );
 }
 
-function PathButton({ label, value, onClick }: { label: string; value: string; onClick: () => void }) {
+function InspectionSummary({
+  inspection,
+  status,
+  message,
+}: {
+  inspection: BatchInspection | null;
+  status: "idle" | "running" | "ready" | "error";
+  message: string;
+}) {
+  if (status !== "ready" || !inspection) {
+    return <div className={`inspection-summary ${status}`}>{message || "选择输入目录后自动预检"}</div>;
+  }
+  const brightfield = inspection.files.filter((file) => file.source_modality === "brightfield").length;
+  const fluorescence = inspection.files.filter((file) => file.source_modality === "fluorescence").length;
+  const unknownChannels = inspection.files.reduce(
+    (count, file) => count + (file.source_modality === "fluorescence"
+      ? file.channel_definitions.filter((channel) => channel.identity_source === "unknown").length
+      : 0),
+    0,
+  );
+  const recognizedChannels = inspection.files.reduce(
+    (count, file) => count + (file.source_modality === "fluorescence"
+      ? file.channel_definitions.filter((channel) => channel.identity_source !== "unknown").length
+      : 0),
+    0,
+  );
   return (
-    <button className="path-picker" onClick={onClick}>
+    <div className="inspection-summary ready">
+      <span>预检完成</span>
+      <strong>{inspection.files.length} 个文件</strong>
+      <span>明场 {brightfield}</span>
+      <span>荧光 {fluorescence}</span>
+      <span>已识别通道 {recognizedChannels}</span>
+      <span className={unknownChannels ? "warning" : ""}>未知通道 {unknownChannels}</span>
+    </div>
+  );
+}
+
+const channelPresets: Record<string, { color: [number, number, number]; excitation_nm: number | null; emission_nm: number | null }> = {
+  DAPI: { color: [0, 0, 255], excitation_nm: 358, emission_nm: 461 },
+  FITC: { color: [0, 255, 0], excitation_nm: 495, emission_nm: 519 },
+  TRITC: { color: [255, 80, 0], excitation_nm: 550, emission_nm: 570 },
+  Cy3: { color: [255, 165, 0], excitation_nm: 550, emission_nm: 570 },
+  Cy5: { color: [255, 0, 80], excitation_nm: 650, emission_nm: 670 },
+  AF: { color: [255, 255, 255], excitation_nm: null, emission_nm: null },
+};
+
+function colorHex(color: [number, number, number]): string {
+  return `#${color.map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function parseColor(value: string): [number, number, number] {
+  const cleaned = value.replace("#", "");
+  return [0, 2, 4].map((index) => Number.parseInt(cleaned.slice(index, index + 2), 16)) as [number, number, number];
+}
+
+function parentPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.slice(0, normalized.lastIndexOf("/"));
+}
+
+function ChannelDialog({
+  files,
+  onCancel,
+  onContinue,
+}: {
+  files: InputInspection[];
+  onCancel: () => void;
+  onContinue: (overrides: Record<string, ChannelDefinition[]>) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [drafts, setDrafts] = useState<Record<string, ChannelDefinition[]>>(() =>
+    Object.fromEntries(
+      files
+        .filter((file) => file.source_modality === "fluorescence" && file.channel_definitions.length > 0)
+        .map((file) => [
+          file.input_path,
+          file.channel_definitions.map((channel) => ({ ...channel, color: [...channel.color] as [number, number, number] })),
+        ]),
+    ),
+  );
+  const visibleFiles = files.filter(
+    (file) => file.source_modality === "fluorescence"
+      && file.channel_definitions.length > 0
+      && file.input_path.toLowerCase().includes(search.trim().toLowerCase()),
+  );
+  const folderGroups = Object.entries(
+    visibleFiles.reduce<Record<string, InputInspection[]>>((groups, file) => {
+      const folder = parentPath(file.input_path);
+      (groups[folder] ||= []).push(file);
+      return groups;
+    }, {}),
+  );
+
+  function update(path: string, index: number, patch: Partial<ChannelDefinition>) {
+    setDrafts((current) => ({
+      ...current,
+      [path]: current[path].map((channel) => channel.index === index
+        ? { ...channel, ...patch, identity_source: "user_supplied" }
+        : channel),
+    }));
+  }
+
+  function applyPreset(path: string, index: number, presetName: string) {
+    const preset = channelPresets[presetName];
+    if (!preset) return;
+    update(path, index, {
+      name: presetName,
+      fluor: presetName,
+      color: preset.color,
+      excitation_nm: preset.excitation_nm,
+      emission_nm: preset.emission_nm,
+    });
+  }
+
+  function applyToFolder(path: string, definition: ChannelDefinition) {
+    const folder = parentPath(path);
+    setDrafts((current) => Object.fromEntries(
+      Object.entries(current).map(([filePath, channels]) => [
+        filePath,
+        parentPath(filePath) === folder
+          ? channels.map((channel) => channel.index === definition.index
+            ? { ...definition, identity_source: "user_supplied" as const }
+            : channel)
+          : channels,
+      ]),
+    ));
+  }
+
+  function applyToSelected(definition: ChannelDefinition) {
+    setDrafts((current) => Object.fromEntries(
+      Object.entries(current).map(([filePath, channels]) => [
+        filePath,
+        selectedPaths.has(filePath)
+          ? channels.map((channel) => channel.index === definition.index
+            ? { ...definition, identity_source: "user_supplied" as const }
+            : channel)
+          : channels,
+      ]),
+    ));
+  }
+
+  function toggleSelected(path: string) {
+    setSelectedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="确认荧光通道定义">
+      <section className="modal-card channel-modal">
+        <header>
+          <div>
+            <h2>确认荧光通道定义</h2>
+            <p>修改只影响输出元数据、显示颜色和文件名，不改变任何像素。</p>
+          </div>
+          <button className="ghost" onClick={onCancel}>关闭</button>
+        </header>
+        <input
+          className="channel-search"
+          placeholder="搜索文件或目录"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
+        <div className="channel-files">
+          {folderGroups.map(([folder, folderFiles]) => (
+            <section className="channel-folder" key={folder}>
+              <h3>{folder || "根目录"}</h3>
+              {folderFiles.map((file) => (
+                <details key={file.input_path} open>
+                  <summary>
+                    <input
+                      type="checkbox"
+                      checked={selectedPaths.has(file.input_path)}
+                      aria-label={`选择 ${basename(file.input_path)}`}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={() => toggleSelected(file.input_path)}
+                    />
+                    <strong>{basename(file.input_path)}</strong>
+                    <span>{file.source_container || file.input_format} · C={file.channel_count} Z={file.z_count} T={file.t_count}</span>
+                  </summary>
+                  {(drafts[file.input_path] || []).map((channel) => (
+                    <div className="channel-row" key={`${file.input_path}-${channel.index}`}>
+                      <span className={`channel-source ${channel.identity_source === "unknown" ? "unknown" : ""}`}>
+                        C{channel.index + 1} · {channel.identity_source}
+                      </span>
+                      <select value={channelPresets[channel.name] ? channel.name : "custom"} onChange={(event) => applyPreset(file.input_path, channel.index, event.target.value)}>
+                        <option value="custom">自定义</option>
+                        {Object.keys(channelPresets).map((name) => <option key={name} value={name}>{name}</option>)}
+                      </select>
+                      <input value={channel.name} aria-label="通道名称" onChange={(event) => update(file.input_path, channel.index, { name: event.target.value, fluor: event.target.value })} />
+                      <input type="color" value={colorHex(channel.color)} aria-label="显示色" onChange={(event) => update(file.input_path, channel.index, { color: parseColor(event.target.value) })} />
+                      <input type="number" placeholder="激发 nm" value={channel.excitation_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { excitation_nm: event.target.value ? Number(event.target.value) : null })} />
+                      <input type="number" placeholder="发射 nm" value={channel.emission_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { emission_nm: event.target.value ? Number(event.target.value) : null })} />
+                      <button className="ghost" disabled={selectedPaths.size === 0} onClick={() => applyToSelected(channel)}>应用到选中文件</button>
+                      <button className="ghost" onClick={() => applyToFolder(file.input_path, channel)}>应用到当前文件夹</button>
+                    </div>
+                  ))}
+                  <p className="output-preview">输出预览：{basename(file.input_path).replace(/\.[^.]+$/, "")}_C01_{drafts[file.input_path]?.[0]?.name || "C1"}.svs</p>
+                </details>
+              ))}
+            </section>
+          ))}
+        </div>
+        <footer>
+          <button className="soft" onClick={() => onContinue({})}>按序号编码并继续</button>
+          <button className="primary" onClick={() => onContinue(drafts)}>使用当前定义并继续</button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function CompatibilityDialog({
+  incompatibleCount,
+  compatibleCount,
+  outputFormat,
+  onBack,
+  onContinue,
+}: {
+  incompatibleCount: number;
+  compatibleCount: number;
+  outputFormat: OutputFormat;
+  onBack: () => void;
+  onContinue: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="批量兼容性确认">
+      <section className="modal-card compatibility-modal">
+        <h2>部分文件与当前格式不兼容</h2>
+        <p>{outputFormat} 可转换 {compatibleCount} 个文件，另有 {incompatibleCount} 个文件将进入报告并标记为 skipped_incompatible。</p>
+        <footer>
+          <button className="soft" onClick={onBack}>返回修改格式</button>
+          <button className="primary" onClick={onContinue}>只转换兼容文件</button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function PathButton({ label, value, onClick, disabled = false }: { label: string; value: string; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button className="path-picker" onClick={onClick} disabled={disabled}>
       <span>{label}</span>
       <strong>
         <Folder size={16} />

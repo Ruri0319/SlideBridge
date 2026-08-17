@@ -76,6 +76,18 @@ class PunuoxiImageSourceTests(unittest.TestCase):
             self.assertEqual(len(native_tiles), 4)
             self.assertTrue(all(tile is not None for tile in native_tiles))
 
+    def test_parallel_native_jpeg_transform_preserves_tile_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "native.image"
+            create_sample_image(path, include_native_resources=True)
+
+            with PunuoxiImageSource(path) as source:
+                serial = list(source.iter_native_level_jpegs(0))
+            with PunuoxiImageSource(path) as source:
+                parallel = list(source.iter_native_level_jpegs_parallel(0, workers=2))
+
+            self.assertEqual(parallel, serial)
+
     def test_invalid_native_resource_pointers_use_legacy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "fallback.image"

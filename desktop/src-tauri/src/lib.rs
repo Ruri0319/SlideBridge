@@ -8,8 +8,10 @@ use tauri_plugin_shell::ShellExt;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 enum OutputFormat {
-    GenericTiff,
+    OmeTiff,
     Svs,
+    FluorescenceSvs,
+    Afi,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -23,6 +25,17 @@ struct ConversionRequest {
     tile_size: Option<u32>,
     jpeg_quality: Option<u32>,
     parallel_wsi: Option<u32>,
+    selected_input_paths: Option<Vec<String>>,
+    convert_compatible_only: Option<bool>,
+    channel_overrides: Option<Value>,
+    input_signatures: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct InspectionRequest {
+    job_id: String,
+    input_dir: String,
+    recursive: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +48,13 @@ struct WorkerStatus {
 struct RunningWorker {
     job_id: String,
     child: CommandChild,
+    kind: WorkerKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerKind {
+    Conversion,
+    Inspection,
 }
 
 #[derive(Default)]
@@ -116,8 +136,10 @@ async fn start_conversion(
         .map_err(|error| CommandError::Worker(error.to_string()))?;
 
     let output_format = match request.output_format {
-        OutputFormat::GenericTiff => "generic_tiff",
+        OutputFormat::OmeTiff => "ome_tiff",
         OutputFormat::Svs => "svs",
+        OutputFormat::FluorescenceSvs => "fluorescence_svs",
+        OutputFormat::Afi => "afi",
     };
     let start_payload = json!({
         "type": "start",
@@ -131,7 +153,11 @@ async fn start_conversion(
             "memory_budget_mb": request.memory_budget_mb.unwrap_or(6144),
             "tile_size": request.tile_size.unwrap_or(256),
             "jpeg_quality": request.jpeg_quality.unwrap_or(90),
-            "parallel_wsi": request.parallel_wsi.unwrap_or(1)
+            "parallel_wsi": request.parallel_wsi.unwrap_or(1),
+            "selected_input_paths": request.selected_input_paths,
+            "convert_compatible_only": request.convert_compatible_only.unwrap_or(false),
+            "channel_overrides": request.channel_overrides.unwrap_or_else(|| json!({})),
+            "input_signatures": request.input_signatures.unwrap_or_else(|| json!({}))
         }
     });
     let message = encode_worker_message(&start_payload)?;
@@ -144,6 +170,7 @@ async fn start_conversion(
         *guard = Some(RunningWorker {
             job_id: request.job_id.clone(),
             child,
+            kind: WorkerKind::Conversion,
         });
     }
 
@@ -163,7 +190,7 @@ async fn start_conversion(
                         .get("type")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
-                    if matches!(event_type, "done" | "error") {
+                    if matches!(event_type, "done" | "error" | "inspection_done" | "inspection_error") {
                         if let Some(state) = app_for_events.try_state::<ConversionManager>() {
                             let mut guard = state.worker.lock().expect("worker mutex poisoned");
                             if guard
@@ -214,6 +241,113 @@ async fn start_conversion(
     Ok(())
 }
 
+#[tauri::command]
+async fn start_inspection(
+    app: AppHandle,
+    manager: State<'_, ConversionManager>,
+    request: InspectionRequest,
+) -> Result<(), CommandError> {
+    {
+        let mut guard = manager.worker.lock().expect("worker mutex poisoned");
+        if guard
+            .as_ref()
+            .is_some_and(|worker| worker.kind == WorkerKind::Conversion)
+        {
+            return Err(CommandError::AlreadyRunning);
+        }
+        if let Some(worker) = guard.take() {
+            let _ = worker.child.kill();
+        }
+    }
+
+    let command = app
+        .shell()
+        .sidecar("slidebridge-worker")
+        .map_err(|error| CommandError::Worker(error.to_string()))?;
+    let (mut receiver, mut child) = command
+        .spawn()
+        .map_err(|error| CommandError::Worker(error.to_string()))?;
+    let payload = json!({
+        "type": "inspect",
+        "job_id": request.job_id,
+        "payload": {
+            "input_dir": request.input_dir,
+            "recursive": request.recursive
+        }
+    });
+    child
+        .write(encode_worker_message(&payload)?.as_bytes())
+        .map_err(|error| CommandError::Worker(error.to_string()))?;
+
+    {
+        let mut guard = manager.worker.lock().expect("worker mutex poisoned");
+        *guard = Some(RunningWorker {
+            job_id: request.job_id.clone(),
+            child,
+            kind: WorkerKind::Inspection,
+        });
+    }
+
+    let app_for_events = app.clone();
+    let worker_job_id = request.job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parsed = serde_json::from_str::<Value>(&line)
+                        .unwrap_or_else(|_| json!({"type": "inspection_error", "message": line}));
+                    let event_type = parsed
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    if matches!(event_type, "inspection_done" | "inspection_error") {
+                        if let Some(state) = app_for_events.try_state::<ConversionManager>() {
+                            let mut guard = state.worker.lock().expect("worker mutex poisoned");
+                            if guard.as_ref().is_some_and(|worker| worker.job_id == worker_job_id) {
+                                if let Some(worker) = guard.take() {
+                                    let _ = worker.child.kill();
+                                }
+                            }
+                        }
+                    }
+                    let _ = app_for_events.emit("conversion:event", parsed);
+                }
+                CommandEvent::Stderr(bytes) => {
+                    let message = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if !message.is_empty() {
+                        let _ = app_for_events.emit(
+                            "conversion:event",
+                            json!({"type": "inspection_error", "job_id": worker_job_id, "message": message}),
+                        );
+                    }
+                }
+                CommandEvent::Terminated(payload) => {
+                    let mut is_current_worker = false;
+                    if let Some(state) = app_for_events.try_state::<ConversionManager>() {
+                        let mut guard = state.worker.lock().expect("worker mutex poisoned");
+                        if guard.as_ref().is_some_and(|worker| worker.job_id == worker_job_id) {
+                            *guard = None;
+                            is_current_worker = true;
+                        }
+                    }
+                    if is_current_worker {
+                        let _ = app_for_events.emit(
+                            "conversion:event",
+                            json!({"type": "worker_terminated", "code": payload.code, "signal": payload.signal}),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -222,6 +356,7 @@ pub fn run() {
         .manage(ConversionManager::default())
         .invoke_handler(tauri::generate_handler![
             start_conversion,
+            start_inspection,
             cancel_conversion,
             worker_status
         ])

@@ -12,7 +12,8 @@ from typing import Any, TextIO
 
 from .app_meta import runtime_banner
 from .converter import convert_folder
-from .models import BatchResult, ConvertOptions, ConvertResult
+from .inspection import inspect_inputs
+from .models import BatchInspection, BatchResult, ConvertOptions, ConvertResult
 from .system_metrics import ProcessMetricsSampler
 
 
@@ -41,6 +42,7 @@ def serialize_result(result: ConvertResult) -> dict[str, Any]:
     return {
         "input_path": str(result.input_path),
         "output_path": str(result.output_path) if result.output_path else None,
+        "output_files": [str(path) for path in (result.output_files or [])],
         "success": result.success,
         "input_format": result.input_format,
         "status": result.status,
@@ -67,6 +69,11 @@ def serialize_result(result: ConvertResult) -> dict[str, Any]:
         "diagnostic_code": result.diagnostic_code,
         "diagnostic_stage": result.diagnostic_stage,
         "svs_omitted_native_data": result.svs_omitted_native_data,
+        "source_modality": result.source_modality,
+        "channel_definitions": result.channel_definitions,
+        "channel_identity_source": result.channel_identity_source,
+        "channel_override_applied": result.channel_override_applied,
+        "skipped_reason": result.skipped_reason,
         "failure_stage": result.failure_stage,
         "error_code": result.error_code,
         "error": result.error,
@@ -78,11 +85,20 @@ def serialize_batch(batch: BatchResult) -> dict[str, Any]:
         "total_files": batch.total_files,
         "success_count": batch.success_count,
         "failed_count": batch.failed_count,
+        "skipped_count": batch.skipped_count,
         "cancelled_count": batch.cancelled_count,
         "cancelled": batch.cancelled,
         "report_path": str(batch.report_path) if batch.report_path else None,
         "results": [serialize_result(result) for result in batch.results],
     }
+
+
+def serialize_inspection(inspection: BatchInspection) -> dict[str, Any]:
+    payload = _json_safe(inspection)
+    for file_payload in payload["files"]:
+        # Nanosecond timestamps exceed JavaScript's safe integer range.
+        file_payload["file_mtime_ns"] = str(file_payload["file_mtime_ns"])
+    return payload
 
 
 def _bounded_int(payload: dict[str, Any], key: str, default: int, minimum: int, maximum: int) -> int:
@@ -94,8 +110,8 @@ def _bounded_int(payload: dict[str, Any], key: str, default: int, minimum: int, 
 
 
 def options_from_request(payload: dict[str, Any]) -> ConvertOptions:
-    output_format = str(payload.get("output_format", "generic_tiff"))
-    if output_format not in {"generic_tiff", "svs"}:
+    output_format = str(payload.get("output_format", "ome_tiff"))
+    if output_format not in {"ome_tiff", "svs", "fluorescence_svs", "afi"}:
         raise WorkerProtocolError(f"unsupported output_format: {output_format}")
     return ConvertOptions(
         recursive=bool(payload.get("recursive", True)),
@@ -104,6 +120,14 @@ def options_from_request(payload: dict[str, Any]) -> ConvertOptions:
         tile_size=_bounded_int(payload, "tile_size", 256, 16, 4096),
         jpeg_quality=_bounded_int(payload, "jpeg_quality", 90, 1, 100),
         parallel_wsi=_bounded_int(payload, "parallel_wsi", 1, 1, 8),
+        selected_input_paths=(
+            tuple(str(path) for path in payload.get("selected_input_paths", []))
+            if payload.get("selected_input_paths") is not None
+            else None
+        ),
+        convert_compatible_only=bool(payload.get("convert_compatible_only", False)),
+        channel_overrides=dict(payload.get("channel_overrides", {}) or {}),
+        input_signatures=dict(payload.get("input_signatures", {}) or {}),
     )
 
 
@@ -138,6 +162,8 @@ class BackendWorker:
         message_type = message.get("type")
         if message_type == "start":
             self.start_job(message)
+        elif message_type == "inspect":
+            self.start_inspection(message)
         elif message_type == "cancel":
             self.cancel_job(str(message.get("job_id") or ""))
         elif message_type == "ping":
@@ -168,6 +194,27 @@ class BackendWorker:
                 daemon=True,
             )
             self.emit("started", job_id=job_id)
+            self._thread.start()
+
+    def start_inspection(self, message: dict[str, Any]) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                self.emit("inspection_error", job_id=message.get("job_id"), message="worker is busy")
+                return
+            job_id = str(message.get("job_id") or int(time.time() * 1000))
+            payload = message.get("payload", message)
+            input_dir = Path(str(payload.get("input_dir", ""))).expanduser()
+            if not input_dir.is_dir():
+                raise WorkerProtocolError(f"invalid input_dir: {input_dir}")
+            recursive = bool(payload.get("recursive", True))
+            self._cancel_event = threading.Event()
+            self._current_job_id = job_id
+            self._thread = threading.Thread(
+                target=self._run_inspection,
+                args=(job_id, input_dir, recursive),
+                daemon=True,
+            )
+            self.emit("inspection_started", job_id=job_id)
             self._thread.start()
 
     def cancel_job(self, job_id: str) -> None:
@@ -248,10 +295,43 @@ class BackendWorker:
         except Exception as exc:
             metrics_stop.set()
             metrics_thread.join(timeout=2)
-            self.emit("error", job_id=job_id, message=str(exc), traceback=traceback.format_exc())
+            self.emit(
+                "error",
+                job_id=job_id,
+                message=str(exc),
+                traceback=traceback.format_exc(),
+                diagnostic_code=getattr(exc, "diagnostic_code", None),
+                diagnostic_stage=getattr(exc, "diagnostic_stage", None),
+            )
         finally:
             metrics_stop.set()
             metrics_thread.join(timeout=2)
+            with self._lock:
+                self._current_job_id = None
+                self._thread = None
+
+    def _run_inspection(self, job_id: str, input_dir: Path, recursive: bool) -> None:
+        try:
+            inspection = inspect_inputs(
+                input_dir,
+                recursive=recursive,
+                progress_callback=lambda done, total, current: self.emit(
+                    "inspection_progress",
+                    job_id=job_id,
+                    done=done,
+                    total=total,
+                    current=current,
+                ),
+            )
+            self.emit("inspection_done", job_id=job_id, inspection=serialize_inspection(inspection))
+        except Exception as exc:
+            self.emit(
+                "inspection_error",
+                job_id=job_id,
+                message=str(exc),
+                traceback=traceback.format_exc(),
+            )
+        finally:
             with self._lock:
                 self._current_job_id = None
                 self._thread = None

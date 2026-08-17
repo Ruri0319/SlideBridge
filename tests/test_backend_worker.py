@@ -4,12 +4,20 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ibl2svs.backend_worker import BackendWorker, main, options_from_request, serialize_batch, serialize_result
-from ibl2svs.models import BatchResult, ConvertOptions, ConvertResult
+from ibl2svs.backend_worker import (
+    BackendWorker,
+    main,
+    options_from_request,
+    serialize_batch,
+    serialize_inspection,
+    serialize_result,
+)
+from ibl2svs.models import BatchInspection, BatchResult, ConvertOptions, ConvertResult, InputInspection
 
 
 class BackendWorkerTests(unittest.TestCase):
@@ -27,7 +35,7 @@ class BackendWorkerTests(unittest.TestCase):
     def test_options_from_request_clamps_adjustable_backend_settings(self) -> None:
         options = options_from_request(
             {
-                "output_format": "generic_tiff",
+                "output_format": "ome_tiff",
                 "memory_budget_mb": 512,
                 "tile_size": 8,
                 "jpeg_quality": 120,
@@ -45,6 +53,47 @@ class BackendWorkerTests(unittest.TestCase):
 
         self.assertEqual(options.parallel_wsi, 8)
         self.assertEqual(options.resolved_parallel_wsi(), 8)
+
+    def test_options_from_request_keeps_preflight_signatures(self) -> None:
+        options = options_from_request(
+            {"input_signatures": {"sample.kfbf": {"size": 123, "mtime_ns": "1786937375479896854"}}}
+        )
+
+        self.assertEqual(options.input_signatures["sample.kfbf"]["size"], 123)
+        self.assertEqual(
+            options.input_signatures["sample.kfbf"]["mtime_ns"],
+            "1786937375479896854",
+        )
+
+    def test_serialize_inspection_preserves_nanosecond_timestamp_as_string(self) -> None:
+        inspection = BatchInspection(
+            Path("/input"),
+            True,
+            (
+                InputInspection(
+                    input_path=Path("/input/sample.kfbf"),
+                    file_size=123,
+                    file_mtime_ns=1_786_937_375_479_896_854,
+                    input_format="kfb",
+                    source_modality="fluorescence",
+                    source_container="kfbf",
+                    source_version="2.1",
+                    source_codec="JPEG",
+                    source_bit_depth=8,
+                    field_count=1,
+                    channel_count=1,
+                    z_count=1,
+                    t_count=1,
+                    channel_definitions=(),
+                    allowed_output_formats=("ome_tiff",),
+                    incompatible_reasons={},
+                ),
+            ),
+        )
+
+        payload = serialize_inspection(inspection)
+
+        self.assertEqual(payload["files"][0]["file_mtime_ns"], "1786937375479896854")
 
     def test_serialize_result_converts_paths_to_strings(self) -> None:
         result = ConvertResult(
@@ -82,6 +131,7 @@ class BackendWorkerTests(unittest.TestCase):
         payload = serialize_batch(batch)
 
         self.assertEqual(payload["report_path"], "conversion_report.csv")
+        self.assertEqual(payload["skipped_count"], 0)
         self.assertEqual(payload["results"][0]["input_path"], "sample.ibl")
 
     def test_worker_emits_json_lines(self) -> None:
@@ -134,7 +184,7 @@ class BackendWorkerTests(unittest.TestCase):
                         "payload": {
                             "input_dir": str(input_dir),
                             "output_dir": str(output_dir),
-                            "output_format": "generic_tiff",
+                            "output_format": "ome_tiff",
                         },
                     }
                 )
@@ -160,6 +210,59 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertTrue(worker._cancel_event.is_set())
         event = json.loads(output.getvalue())
         self.assertEqual(event["type"], "log")
+
+    def test_worker_inspection_emits_progress_and_done(self) -> None:
+        output = io.StringIO()
+        worker = BackendWorker(stdin=io.StringIO(), stdout=output)
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            inspection = BatchInspection(root, True, ())
+
+            def fake_inspect(input_dir, recursive, progress_callback):
+                progress_callback(0, 1, "sample.kfbf")
+                progress_callback(1, 1, "")
+                return inspection
+
+            with mock.patch("ibl2svs.backend_worker.inspect_inputs", side_effect=fake_inspect):
+                worker.start_inspection(
+                    {
+                        "type": "inspect",
+                        "job_id": "inspect-1",
+                        "payload": {"input_dir": str(root), "recursive": True},
+                    }
+                )
+                thread = worker._thread
+                assert thread is not None
+                thread.join(timeout=2)
+
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[0]["type"], "inspection_started")
+        self.assertEqual([event["type"] for event in events].count("inspection_progress"), 2)
+        self.assertEqual(events[-1]["type"], "inspection_done")
+
+    def test_worker_rejects_inspection_while_busy(self) -> None:
+        output = io.StringIO()
+        worker = BackendWorker(stdin=io.StringIO(), stdout=output)
+        stop = threading.Event()
+        worker._thread = threading.Thread(target=stop.wait)
+        worker._thread.start()
+        worker._current_job_id = "job-1"
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                worker.start_inspection(
+                    {
+                        "type": "inspect",
+                        "job_id": "inspect-1",
+                        "payload": {"input_dir": tempdir},
+                    }
+                )
+        finally:
+            stop.set()
+            worker._thread.join(timeout=2)
+
+        event = json.loads(output.getvalue())
+        self.assertEqual(event["type"], "inspection_error")
+        self.assertEqual(event["message"], "worker is busy")
 
 
 if __name__ == "__main__":

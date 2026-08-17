@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import struct
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,7 @@ from ibl2svs.converter import (
     write_report,
 )
 from ibl2svs.models import ConvertOptions, ConvertResult
+from ibl2svs.inspection import inspect_file
 from ibl2svs.writer import WriteImageError
 from tests.support import create_sample_ibl, create_sample_image, create_sample_kfb
 
@@ -49,19 +51,32 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(detect_input_format("a.kfba"), "kfb")
         self.assertEqual(detect_input_format("a.kfbx"), "kfb")
         self.assertEqual(detect_input_format("a.image"), "image")
+        self.assertEqual(detect_input_format("a.afi"), "afi")
         self.assertEqual(detect_input_format("a.txt"), "unsupported")
 
     def test_find_convertible_files_depends_on_output_format(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx", "f.txt"]:
+            for name in ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx", "k.afi", "f.txt"]:
                 (root / name).write_text("x")
 
             to_svs = find_convertible_files(root, recursive=False, output_format="svs")
-            to_tiff = find_convertible_files(root, recursive=False, output_format="generic_tiff")
+            to_tiff = find_convertible_files(root, recursive=False, output_format="ome_tiff")
 
-            self.assertEqual([path.name for path in to_svs], ["a.ibl", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx"])
-            self.assertEqual([path.name for path in to_tiff], ["a.ibl", "b.svs", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx"])
+            expected = ["a.ibl", "b.svs", "c.tif", "d.tiff", "e.kfb", "f.kfbf", "g.image", "h.kfbl", "i.kfba", "j.kfbx", "k.afi"]
+            self.assertEqual([path.name for path in to_svs], expected)
+            self.assertEqual([path.name for path in to_tiff], expected)
+
+    def test_brightfield_image_has_no_fluorescence_channel_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "sample.image"
+            create_sample_image(path)
+
+            inspection = inspect_file(path)
+
+        self.assertEqual(inspection.source_modality, "brightfield")
+        self.assertEqual(inspection.channel_count, 0)
+        self.assertEqual(inspection.channel_definitions, ())
 
     def test_build_output_path_avoids_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -72,12 +87,12 @@ class ConverterTests(unittest.TestCase):
             source.parent.mkdir()
             source.write_text("x")
 
-            first = build_output_path(source, root / "in", out, "generic_tiff")
+            first = build_output_path(source, root / "in", out, "ome_tiff")
             first.touch()
-            second = build_output_path(source, root / "in", out, "generic_tiff")
+            second = build_output_path(source, root / "in", out, "ome_tiff")
 
-            self.assertEqual(first.name, "sample.tif")
-            self.assertEqual(second.name, "sample_1.tif")
+            self.assertEqual(first.name, "sample.ome.tif")
+            self.assertEqual(second.name, "sample_1.ome.tif")
 
     def test_build_output_path_supports_svs_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -117,7 +132,7 @@ class ConverterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             source = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(source)
             cancel_event = threading.Event()
             cancel_event.set()
@@ -156,7 +171,7 @@ class ConverterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             source = root / "sample.kfb"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_kfb(source)
 
             def fake_write_image(slide, output_path, options, progress_callback=None, cancel_event=None):
@@ -180,7 +195,7 @@ class ConverterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             source = root / "unknown.kfb"
-            output = root / "unknown.tif"
+            output = root / "unknown.ome.tif"
             create_sample_kfb(source)
             with source.open("r+b") as fh:
                 fh.seek(0x0C)
@@ -198,7 +213,7 @@ class ConverterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             source = root / "sample.image"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_image(source)
 
             def fake_write_image(slide, output_path, options, progress_callback=None, cancel_event=None):
@@ -238,15 +253,18 @@ class ConverterTests(unittest.TestCase):
                     output_format=options.output_format,
                 )
 
-            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert):
+            inspection = mock.Mock(error=None, allowed_output_formats=("ome_tiff",))
+            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert), mock.patch(
+                "ibl2svs.converter.inspect_file", return_value=inspection
+            ):
                 batch = convert_folder(
                     input_dir,
                     output_dir,
-                    ConvertOptions(output_format="generic_tiff", parallel_wsi=2),
+                    ConvertOptions(output_format="ome_tiff", parallel_wsi=2),
                 )
 
             self.assertEqual(batch.success_count, 2)
-            self.assertEqual([result.output_path.name for result in batch.results if result.output_path], ["sample.tif", "sample_1.tif"])
+            self.assertEqual([result.output_path.name for result in batch.results if result.output_path], ["sample.ome.tif", "sample_1.ome.tif"])
 
     def test_convert_folder_parallel_mode_runs_multiple_files_concurrently(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -277,11 +295,14 @@ class ConverterTests(unittest.TestCase):
                     output_format=options.output_format,
                 )
 
-            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert):
+            inspection = mock.Mock(error=None, allowed_output_formats=("ome_tiff",))
+            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert), mock.patch(
+                "ibl2svs.converter.inspect_file", return_value=inspection
+            ):
                 batch = convert_folder(
                     input_dir,
                     output_dir,
-                    ConvertOptions(output_format="generic_tiff", parallel_wsi=2),
+                    ConvertOptions(output_format="ome_tiff", parallel_wsi=2),
                 )
 
             self.assertEqual(batch.success_count, 3)
@@ -308,18 +329,92 @@ class ConverterTests(unittest.TestCase):
                     output_format=options.output_format,
                 )
 
-            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert):
+            inspection = mock.Mock(error=None, allowed_output_formats=("ome_tiff",))
+            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert), mock.patch(
+                "ibl2svs.converter.inspect_file", return_value=inspection
+            ):
                 convert_folder(
                     input_dir,
                     output_dir,
                     ConvertOptions(
-                        output_format="generic_tiff",
+                        output_format="ome_tiff",
                         parallel_wsi=3,
                         memory_budget_mb=6144,
                     ),
                 )
 
             self.assertEqual(task_budgets, [2048, 2048, 2048])
+
+    def test_preflight_signature_change_is_reported_as_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            sample = input_dir / "sample.kfbf"
+            create_sample_kfb(
+                sample,
+                variant="kfbf",
+                fluorescence_channel=("DAPI", (0, 0, 255), 85.0),
+            )
+            inspection = inspect_file(sample)
+            stat = sample.stat()
+            os.utime(sample, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+            batch = convert_folder(
+                input_dir,
+                output_dir,
+                ConvertOptions(
+                    output_format="ome_tiff",
+                    convert_compatible_only=True,
+                    input_signatures={
+                        str(sample): {
+                            "size": inspection.file_size,
+                            "mtime_ns": inspection.file_mtime_ns,
+                        }
+                    },
+                ),
+            )
+
+            self.assertEqual(batch.skipped_count, 1)
+            self.assertIn("预检后发生变化", batch.results[0].skipped_reason)
+
+    def test_overall_progress_counts_skipped_incompatible_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            create_sample_kfb(input_dir / "brightfield.kfb")
+            fluorescence = input_dir / "fluorescence.kfbf"
+            create_sample_kfb(
+                fluorescence,
+                variant="kfbf",
+                fluorescence_channel=("DAPI", (0, 0, 255), 85.0),
+            )
+            progress: list[tuple[int, int, str]] = []
+
+            def fake_convert(input_path, output_path, options, logger=None, progress_callback=None, cancel_event=None):
+                return ConvertResult(
+                    input_path=Path(input_path),
+                    output_path=Path(output_path),
+                    success=True,
+                    output_format=options.output_format,
+                )
+
+            with mock.patch("ibl2svs.converter.convert_file", side_effect=fake_convert):
+                batch = convert_folder(
+                    input_dir,
+                    output_dir,
+                    ConvertOptions(output_format="fluorescence_svs", convert_compatible_only=True),
+                    overall_callback=lambda done, total, current: progress.append((done, total, current)),
+                )
+
+            self.assertEqual(batch.skipped_count, 1)
+            self.assertEqual(batch.success_count, 1)
+            self.assertEqual(progress[-1][:2], (2, 2))
 
 
 if __name__ == "__main__":

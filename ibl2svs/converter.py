@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from pathlib import Path
 
 from .app_meta import runtime_banner
-from .kfb_source import KfbSlideSource
-from .models import BatchResult, ConvertOptions, ConvertResult
-from .punuoxi_source import PunuoxiImageSource
-from .reader import IBLSlide
-from .tiff_source import TiffSlideSource
+from .inspection import (
+    SUPPORTED_INPUT_SUFFIXES,
+    apply_channel_overrides,
+    channel_definitions,
+    detect_input_format,
+    find_inspectable_files,
+    inspect_file,
+    open_slide,
+    output_eligibility,
+)
+from .models import BatchResult, ConvertOptions, ConvertResult, OutputFormat
 from .writer import WriteImageError, write_image
+
+
+class OutputCompatibilityError(RuntimeError):
+    diagnostic_code = "incompatible_output"
+    diagnostic_stage = "preflight"
 
 
 def _safe_unlink(path: Path, retries: int = 8, delay: float = 0.15) -> None:
@@ -38,59 +50,43 @@ def find_ibl_files(input_dir: str | Path, recursive: bool = True) -> list[Path]:
     return sorted(files)
 
 
-def detect_input_format(path: str | Path) -> str:
-    suffix = Path(path).suffix.lower()
-    if suffix == ".ibl":
-        return "ibl"
-    if suffix == ".svs":
-        return "svs"
-    if suffix in {".tif", ".tiff"}:
-        return "generic_tiff"
-    if suffix in {".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx"}:
-        return "kfb"
-    if suffix == ".image":
-        return "image"
-    return "unsupported"
-
-
 def find_convertible_files(
     input_dir: str | Path,
     recursive: bool = True,
-    output_format: str = "generic_tiff",
+    output_format: str = "ome_tiff",
 ) -> list[Path]:
-    input_dir = Path(input_dir)
-    pattern = "**/*" if recursive else "*"
-    if output_format == "svs":
-        suffixes = {".ibl", ".tif", ".tiff", ".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx", ".image"}
-    else:
-        suffixes = {".ibl", ".svs", ".kfb", ".kfbl", ".kfbf", ".kfba", ".kfbx", ".image"}
-    files = [
-        path
-        for path in input_dir.glob(pattern)
-        if path.is_file() and path.suffix.lower() in suffixes
-    ]
-    return sorted(files)
+    del output_format
+    return find_inspectable_files(input_dir, recursive=recursive)
+
+
+def _output_suffix(output_format: str) -> str:
+    if output_format == "ome_tiff":
+        return ".ome.tif"
+    if output_format in {"svs", "fluorescence_svs"}:
+        return ".svs"
+    if output_format == "afi":
+        return ".afi"
+    raise ValueError(f"不支持的输出格式: {output_format}")
 
 
 def build_output_path(
     input_path: Path,
     input_root: Path,
     output_root: Path,
-    output_format: str = "generic_tiff",
+    output_format: str = "ome_tiff",
 ) -> Path:
     relative = input_path.relative_to(input_root)
     candidate = output_root / relative
-    suffix = ".svs" if output_format == "svs" else ".tif"
+    suffix = _output_suffix(output_format)
     candidate = candidate.with_suffix(suffix)
     candidate.parent.mkdir(parents=True, exist_ok=True)
     if not candidate.exists():
         return candidate
 
-    stem = candidate.stem
-    suffix = candidate.suffix
+    base_name = candidate.name[: -len(suffix)]
     index = 1
     while True:
-        alt = candidate.with_name(f"{stem}_{index}{suffix}")
+        alt = candidate.with_name(f"{base_name}_{index}{suffix}")
         if not alt.exists():
             return alt
         index += 1
@@ -104,17 +100,16 @@ def _build_output_plan(
 ) -> list[tuple[int, Path, Path]]:
     reserved: set[Path] = set()
     planned: list[tuple[int, Path, Path]] = []
-    suffix = ".svs" if output_format == "svs" else ".tif"
+    suffix = _output_suffix(output_format)
     for index, input_path in enumerate(files, start=1):
         relative = input_path.relative_to(input_root)
         candidate = (output_root / relative).with_suffix(suffix)
         candidate.parent.mkdir(parents=True, exist_ok=True)
         if candidate.exists() or candidate in reserved:
-            stem = candidate.stem
-            suffix_value = candidate.suffix
+            stem = candidate.name[: -len(suffix)]
             alt_index = 1
             while True:
-                alt = candidate.with_name(f"{stem}_{alt_index}{suffix_value}")
+                alt = candidate.with_name(f"{stem}_{alt_index}{suffix}")
                 if not alt.exists() and alt not in reserved:
                     candidate = alt
                     break
@@ -133,6 +128,7 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                 "input_path",
                 "input_format",
                 "output_path",
+                "output_files",
                 "success",
                 "status",
                 "output_format",
@@ -173,6 +169,11 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                 "diagnostic_code",
                 "diagnostic_stage",
                 "svs_omitted_native_data",
+                "source_modality",
+                "channel_definitions",
+                "channel_identity_source",
+                "channel_override_applied",
+                "skipped_reason",
                 "failure_stage",
                 "error_code",
                 "error",
@@ -184,6 +185,7 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                     str(result.input_path),
                     result.input_format,
                     str(result.output_path) if result.output_path else "",
+                    "|".join(str(path) for path in (result.output_files or [])),
                     result.success,
                     result.status,
                     result.output_format,
@@ -224,11 +226,47 @@ def write_report(results: list[ConvertResult], report_path: Path) -> None:
                     result.diagnostic_code or "",
                     result.diagnostic_stage or "",
                     result.svs_omitted_native_data or "",
+                    result.source_modality or "",
+                    str(result.channel_definitions or ""),
+                    "|".join(result.channel_identity_source or []),
+                    result.channel_override_applied,
+                    result.skipped_reason or "",
                     result.failure_stage or "",
                     result.error_code or "",
                     result.error or "",
                 ]
             )
+
+
+def _afi_perf(slide, options: ConvertOptions) -> dict:
+    return {
+        "backend": options.performance_backend,
+        "current_stage": "初始化 AFI",
+        "level_dimensions": list(getattr(slide, "level_dimensions", [])),
+        "read_decode_sec": 0.0,
+        "main_write_sec": 0.0,
+        "pyramid_sec": 0.0,
+        "thumbnail_sec": 0.0,
+        "encode_sec": 0.0,
+        "writer_wait_sec": 0.0,
+        "peak_memory_mb": 0.0,
+        "avg_cpu_percent": 0.0,
+        "native_path": True,
+        "native_level_dimensions": list(getattr(slide, "level_dimensions", [])),
+        "native_resource_dimensions": dict(getattr(slide, "native_resource_dimensions", {})),
+        "native_tile_mode": None,
+        "native_fallback_reason": None,
+        "source_container": getattr(slide, "source_container", None),
+        "source_version": getattr(slide, "source_version", None),
+        "source_codec": getattr(slide, "source_codec", None),
+        "source_bit_depth": getattr(slide, "source_bit_depth", None),
+        "source_channel_count": getattr(slide, "native_channel_count", None),
+        "source_axes": getattr(slide, "native_axes", None),
+        "compatibility_level": getattr(slide, "compatibility_level", None),
+        "diagnostic_code": None,
+        "diagnostic_stage": None,
+        "failure_stage": None,
+    }
 
 
 def convert_file(
@@ -242,11 +280,16 @@ def convert_file(
     input_path = Path(input_path)
     output_path = Path(output_path)
     input_format = detect_input_format(input_path)
-    target_suffix = ".tif" if options.output_format == "generic_tiff" else ".svs"
-    output_path = output_path.with_suffix(target_suffix)
+    target_suffix = _output_suffix(options.output_format)
+    if not output_path.name.lower().endswith(target_suffix):
+        output_path = output_path.with_suffix(target_suffix)
     temp_output_path = output_path.with_suffix(f"{output_path.suffix}.part")
     start = time.perf_counter()
     error_code = None
+    source_summary: dict = {}
+    definitions = []
+    perf: dict = {}
+    output_files: list[Path] = []
 
     def existing_output_path() -> Path | None:
         return output_path if output_path.exists() else None
@@ -258,16 +301,27 @@ def convert_file(
         if temp_output_path.exists():
             _safe_unlink(temp_output_path)
 
-        if input_format == "ibl":
-            slide_context = IBLSlide(input_path, cache_size=options.cache_blocks_per_row)
-        elif input_format == "kfb":
-            slide_context = KfbSlideSource(input_path, cache_size=options.cache_blocks_per_row or 256)
-        elif input_format == "image":
-            slide_context = PunuoxiImageSource(input_path, cache_size=options.cache_blocks_per_row or 256)
-        else:
-            slide_context = TiffSlideSource(input_path)
+        slide_context = open_slide(input_path, cache_size=options.cache_blocks_per_row)
 
         with slide_context as slide:
+            override = options.channel_overrides.get(str(input_path))
+            if override is None:
+                override = options.channel_overrides.get(str(input_path.resolve()))
+            definitions = apply_channel_overrides(slide, override)
+            source_summary = {
+                "source_modality": getattr(slide, "modality", "unknown"),
+                "source_container": getattr(slide, "source_container", None),
+                "source_version": getattr(slide, "source_version", None),
+                "source_codec": getattr(slide, "source_codec", None),
+                "source_bit_depth": getattr(slide, "source_bit_depth", None),
+                "source_channel_count": getattr(slide, "native_channel_count", None),
+                "source_axes": getattr(slide, "native_axes", None),
+                "compatibility_level": getattr(slide, "compatibility_level", None),
+            }
+            allowed_formats, incompatible_reasons = output_eligibility(slide)
+            if options.output_format not in allowed_formats:
+                reason = incompatible_reasons.get(options.output_format, "输入与所选输出格式不兼容")
+                raise OutputCompatibilityError(reason)
             if logger:
                 logger(f"开始转换: {input_path}")
 
@@ -281,14 +335,29 @@ def convert_file(
                 if progress_callback:
                     progress_callback(str(input_path), level_name, done, total, overall_done, overall_total)
 
-            pyramid_levels, perf = write_image(
-                slide,
-                temp_output_path,
-                options,
-                progress_callback=writer_progress,
-                cancel_event=cancel_event,
-            )
-            temp_output_path.replace(output_path)
+            if options.output_format == "afi":
+                from .afi_writer import write_afi
+
+                perf = _afi_perf(slide, options)
+                pyramid_levels, output_files = write_afi(
+                    slide,
+                    output_path,
+                    options,
+                    perf,
+                    progress_callback=writer_progress,
+                    cancel_event=cancel_event,
+                )
+                output_path = Path(perf["primary_output_path"])
+            else:
+                pyramid_levels, perf = write_image(
+                    slide,
+                    temp_output_path,
+                    options,
+                    progress_callback=writer_progress,
+                    cancel_event=cancel_event,
+                )
+                temp_output_path.replace(output_path)
+                output_files = [output_path]
             duration = time.perf_counter() - start
             result = ConvertResult(
                 input_path=input_path,
@@ -335,6 +404,11 @@ def convert_file(
                 diagnostic_code=perf.get("diagnostic_code"),
                 diagnostic_stage=perf.get("diagnostic_stage"),
                 svs_omitted_native_data=perf.get("svs_omitted_native_data"),
+                output_files=output_files,
+                source_modality=source_summary["source_modality"],
+                channel_definitions=[asdict(definition) for definition in definitions],
+                channel_identity_source=[definition.identity_source for definition in definitions],
+                channel_override_applied=bool(override),
             )
             if logger:
                 logger(
@@ -386,6 +460,8 @@ def convert_file(
         duration = time.perf_counter() - start
         status = "cancelled" if cancel_event is not None and cancel_event.is_set() else "failed"
         error_code = "CANCELLED" if status == "cancelled" else "CONVERT_FAILED"
+        if status != "cancelled" and perf.get("diagnostic_code"):
+            error_code = perf["diagnostic_code"]
         if logger:
             logger(f"失败: {input_path.name}: {exc}")
         return ConvertResult(
@@ -429,6 +505,11 @@ def convert_file(
             diagnostic_code=perf.get("diagnostic_code"),
             diagnostic_stage=perf.get("diagnostic_stage"),
             svs_omitted_native_data=perf.get("svs_omitted_native_data"),
+            output_files=[Path(path) for path in perf.get("output_files", [])] or None,
+            source_modality=source_summary.get("source_modality"),
+            channel_definitions=[asdict(definition) for definition in definitions] or None,
+            channel_identity_source=[definition.identity_source for definition in definitions] or None,
+            channel_override_applied=bool(getattr(slide_context, "channel_override_applied", False)),
             error_code=error_code,
             error=str(exc),
         )
@@ -459,15 +540,23 @@ def convert_file(
             output_format=options.output_format,
             backend=options.performance_backend,
             duration_sec=duration,
-            source_container=getattr(exc, "source_container", None),
-            source_version=getattr(exc, "source_version", None),
+            source_container=getattr(exc, "source_container", None) or source_summary.get("source_container"),
+            source_version=getattr(exc, "source_version", None) or source_summary.get("source_version"),
             compatibility_level=(
                 "static_unverified"
                 if getattr(exc, "source_container", None) in {"kfba", "kfbx"}
-                else None
+                else source_summary.get("compatibility_level")
             ),
             diagnostic_code=diagnostic_code,
             diagnostic_stage=diagnostic_stage,
+            source_modality=source_summary.get("source_modality"),
+            source_codec=source_summary.get("source_codec"),
+            source_bit_depth=source_summary.get("source_bit_depth"),
+            source_channel_count=source_summary.get("source_channel_count"),
+            source_axes=source_summary.get("source_axes"),
+            channel_definitions=[asdict(definition) for definition in definitions] or None,
+            channel_identity_source=[definition.identity_source for definition in definitions] or None,
+            channel_override_applied=bool(definitions and any(definition.identity_source == "user_supplied" for definition in definitions)),
             error_code=error_code,
             error=str(exc),
         )
@@ -484,21 +573,100 @@ def convert_folder(
 ) -> BatchResult:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
-    files = find_convertible_files(input_dir, recursive=options.recursive, output_format=options.output_format)
-    output_plan = _build_output_plan(files, input_dir, output_dir, options.output_format)
+    if options.selected_input_paths is None:
+        files = find_convertible_files(input_dir, recursive=options.recursive, output_format=options.output_format)
+    else:
+        selected = {Path(path).resolve() for path in options.selected_input_paths}
+        files = [
+            path
+            for path in find_inspectable_files(input_dir, recursive=options.recursive)
+            if path.resolve() in selected
+        ]
+
+    inspections = [(path, inspect_file(path)) for path in files]
+    compatible_files: list[Path] = []
+    incompatible: list[tuple[int, Path, object, str]] = []
+    for index, (path, inspection) in enumerate(inspections, start=1):
+        expected_signature = options.input_signatures.get(str(path))
+        if expected_signature is None:
+            expected_signature = options.input_signatures.get(str(path.resolve()))
+        signature_changed = expected_signature is not None and (
+            int(expected_signature.get("size", -1)) != inspection.file_size
+            or int(expected_signature.get("mtime_ns", -1)) != inspection.file_mtime_ns
+        )
+        if signature_changed:
+            incompatible.append((index, path, inspection, "文件在预检后发生变化，请重新预检"))
+        elif inspection.error:
+            incompatible.append((index, path, inspection, inspection.error))
+        elif options.output_format not in inspection.allowed_output_formats:
+            incompatible.append(
+                (
+                    index,
+                    path,
+                    inspection,
+                    inspection.incompatible_reasons.get(
+                        options.output_format,
+                        "输入与所选输出格式不兼容",
+                    ),
+                )
+            )
+        else:
+            compatible_files.append(path)
+    if incompatible and not options.convert_compatible_only:
+        details = "；".join(f"{path.name}: {reason}" for _, path, _, reason in incompatible[:5])
+        raise OutputCompatibilityError(
+            f"有 {len(incompatible)} 个文件与 {options.output_format} 不兼容；"
+            f"请选择“只转换兼容文件”或修改输出格式。{details}"
+        )
+
+    path_indexes = {path: index for index, path in enumerate(files, start=1)}
+    output_plan = [
+        (path_indexes[input_path], input_path, output_path)
+        for _, input_path, output_path in _build_output_plan(
+            compatible_files,
+            input_dir,
+            output_dir,
+            options.output_format,
+        )
+    ]
     result_entries: list[tuple[int, ConvertResult]] = []
+    for index, path, inspection, reason in incompatible:
+        result_entries.append(
+            (
+                index,
+                ConvertResult(
+                    input_path=path,
+                    output_path=None,
+                    success=False,
+                    input_format=inspection.input_format,
+                    status="skipped_incompatible",
+                    output_format=options.output_format,
+                    source_modality=inspection.source_modality,
+                    source_container=inspection.source_container,
+                    source_version=inspection.source_version,
+                    source_codec=inspection.source_codec,
+                    source_bit_depth=inspection.source_bit_depth,
+                    source_channel_count=inspection.channel_count,
+                    channel_definitions=[asdict(item) for item in inspection.channel_definitions],
+                    channel_identity_source=[item.identity_source for item in inspection.channel_definitions],
+                    skipped_reason=reason,
+                ),
+            )
+        )
     cancelled = False
     parallel_wsi = options.resolved_parallel_wsi()
 
     if logger:
         logger(runtime_banner())
-        logger(f"发现 {len(files)} 个可转换文件")
+        logger(f"发现 {len(files)} 个输入文件，其中 {len(compatible_files)} 个兼容当前输出格式")
         logger(f"WSI 并行任务数: {parallel_wsi}")
 
+    completed_before_conversion = len(incompatible)
     if overall_callback and files:
-        overall_callback(0, len(files), str(files[0]))
+        overall_callback(completed_before_conversion, len(files), "")
 
     if parallel_wsi <= 1 or len(output_plan) <= 1:
+        completed = completed_before_conversion
         for index, input_path, output_path in output_plan:
             if cancel_event is not None and cancel_event.is_set():
                 if logger:
@@ -507,7 +675,7 @@ def convert_folder(
                 break
 
             if overall_callback:
-                overall_callback(index - 1, len(files), str(input_path))
+                overall_callback(completed, len(files), str(input_path))
             result = convert_file(
                 input_path,
                 output_path,
@@ -517,14 +685,15 @@ def convert_folder(
                 cancel_event=cancel_event,
             )
             result_entries.append((index, result))
+            completed += 1
 
             if overall_callback:
-                overall_callback(index, len(files), str(input_path))
+                overall_callback(completed, len(files), str(input_path))
             if not result.success and not options.continue_on_error:
                 break
     else:
         pending_index = 0
-        completed = 0
+        completed = completed_before_conversion
         stop_submitting = False
         cancel_logged = False
         active_parallel_wsi = min(parallel_wsi, len(output_plan))
@@ -596,6 +765,7 @@ def convert_folder(
         total_files=len(files),
         success_count=sum(1 for result in results if result.success),
         failed_count=sum(1 for result in results if result.status == "failed"),
+        skipped_count=sum(1 for result in results if result.status == "skipped_incompatible"),
         cancelled_count=sum(1 for result in results if result.status == "cancelled"),
         cancelled=cancelled or any(result.status == "cancelled" for result in results),
         results=results,
@@ -605,7 +775,7 @@ def convert_folder(
     if logger:
         message = (
             f"批处理结束: 成功 {batch.success_count} 个, 失败 {batch.failed_count} 个, "
-            f"取消 {batch.cancelled_count} 个, 总计 {batch.total_files} 个"
+            f"跳过 {batch.skipped_count} 个, 取消 {batch.cancelled_count} 个, 总计 {batch.total_files} 个"
         )
         logger(message)
         logger(f"报告已写入: {batch.report_path}")

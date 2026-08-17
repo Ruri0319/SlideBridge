@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+
+OutputFormat = Literal["ome_tiff", "svs", "fluorescence_svs", "afi"]
+SourceModality = Literal["brightfield", "fluorescence", "unknown"]
+ChannelIdentitySource = Literal[
+    "source_metadata",
+    "documented_vendor_id",
+    "user_supplied",
+    "unknown",
+]
 
 
 @dataclass(frozen=True)
@@ -50,11 +60,55 @@ class BlockRecord:
     y1: int
 
 
+@dataclass(frozen=True)
+class ChannelDefinition:
+    index: int
+    name: str
+    fluor: str | None = None
+    color: tuple[int, int, int] = (255, 255, 255)
+    excitation_nm: float | None = None
+    emission_nm: float | None = None
+    exposure: float | None = None
+    identity_source: ChannelIdentitySource = "unknown"
+
+
+@dataclass(frozen=True)
+class InputInspection:
+    input_path: Path
+    file_size: int
+    file_mtime_ns: int
+    input_format: str
+    source_modality: SourceModality
+    source_container: str | None
+    source_version: str | None
+    source_codec: str | None
+    source_bit_depth: int
+    field_count: int
+    channel_count: int
+    z_count: int
+    t_count: int
+    channel_definitions: tuple[ChannelDefinition, ...]
+    allowed_output_formats: tuple[OutputFormat, ...]
+    incompatible_reasons: dict[str, str]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchInspection:
+    input_dir: Path
+    recursive: bool
+    files: tuple[InputInspection, ...]
+
+    @property
+    def total_files(self) -> int:
+        return len(self.files)
+
+
 @dataclass
 class ConvertOptions:
     recursive: bool = True
-    output_format: Literal["generic_tiff", "svs"] = "generic_tiff"
-    performance_backend: Literal["pyvips"] = "pyvips"
+    output_format: OutputFormat = "ome_tiff"
+    performance_backend: Literal["tifffile"] = "tifffile"
     svs_use_bigtiff: bool | Literal["auto"] = "auto"
     svs_generate_label: bool = True
     svs_generate_macro: bool = True
@@ -72,10 +126,16 @@ class ConvertOptions:
     raw_queue_size: int | None = None
     encoded_queue_size: int | None = None
     parallel_wsi: int = 1
+    selected_input_paths: tuple[str, ...] | None = None
+    convert_compatible_only: bool = False
+    channel_overrides: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    input_signatures: dict[str, dict[str, int | str]] = field(default_factory=dict)
 
     def resolved_tile_size(self) -> int:
         if self.output_format == "svs" and self.tile_size == 256:
             return 240
+        if self.output_format in {"fluorescence_svs", "afi"}:
+            return 256
         return self.tile_size
 
     def resolved_jpeg_quality(self) -> int:
@@ -136,8 +196,8 @@ class ConvertResult:
     success: bool
     input_format: str = "ibl"
     status: str = "success"
-    output_format: str = "generic_tiff"
-    backend: str = "pyvips"
+    output_format: str = "ome_tiff"
+    backend: str = "tifffile"
     width: int | None = None
     height: int | None = None
     level_dimensions: list[tuple[int, int]] | None = None
@@ -177,6 +237,12 @@ class ConvertResult:
     diagnostic_code: str | None = None
     diagnostic_stage: str | None = None
     svs_omitted_native_data: str | None = None
+    output_files: list[Path] | None = None
+    source_modality: str | None = None
+    channel_definitions: list[dict[str, Any]] | None = None
+    channel_identity_source: list[str] | None = None
+    channel_override_applied: bool = False
+    skipped_reason: str | None = None
 
 
 @dataclass
@@ -184,6 +250,7 @@ class BatchResult:
     total_files: int
     success_count: int
     failed_count: int
+    skipped_count: int = 0
     cancelled_count: int = 0
     cancelled: bool = False
     report_path: Path | None = None

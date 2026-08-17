@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import struct
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image
@@ -26,6 +27,12 @@ class TiffBaseInfo:
     background_color: int = 255
 
 
+@dataclass(frozen=True)
+class TiffNativeLevel:
+    dimensions: tuple[int, int]
+    records: tuple = ()
+
+
 class TiffSlideSource:
     """Tile/strip based TIFF/SVS source compatible with the writer API."""
 
@@ -42,10 +49,13 @@ class TiffSlideSource:
             self.height = int(self._page.imagelength)
             self.channels = 3
             self._segment_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+            self._plane_segment_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
             self._preview_image: Image.Image | None = None
+            self._configure_source_semantics()
             self.base_info = TiffBaseInfo(
                 mpp=self._extract_mpp(),
                 max_zoom_rate=self._extract_app_mag(),
+                background_color=0 if self.modality == "fluorescence" else 255,
             )
             self._validate_main_page()
         except Exception:
@@ -94,8 +104,10 @@ class TiffSlideSource:
         return self._tif.pages[0]
 
     def _validate_main_page(self) -> None:
-        if self._page.dtype != np.uint8:
+        if self._page.dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
             raise RuntimeError("仅支持 uint8 TIFF/SVS 输入")
+        if self._page.dtype == np.uint16 and self.modality != "fluorescence":
+            raise RuntimeError("仅支持 uint8；只有明确荧光 OME-TIFF 支持 uint16 输入")
         if int(getattr(self._page, "planarconfig", 1) or 1) != 1:
             raise RuntimeError("暂不支持 planar-separated TIFF/SVS 输入")
         if int(getattr(self._page, "photometric", 0) or 0) == PALETTE_PHOTOMETRIC:
@@ -104,7 +116,185 @@ class TiffSlideSource:
         if samples not in (1, 3, 4):
             raise RuntimeError("仅支持 grayscale、RGB 或 RGBA TIFF/SVS 输入")
 
+    @staticmethod
+    def _ome_color(value: str | None) -> tuple[int, int, int]:
+        if not value:
+            return (255, 255, 255)
+        packed = int(value) & 0xFFFFFFFF
+        return ((packed >> 24) & 0xFF, (packed >> 16) & 0xFF, (packed >> 8) & 0xFF)
+
+    @staticmethod
+    def _description_property(description: str, name: str) -> str | None:
+        match = re.search(rf"(?:^|\|){re.escape(name)}\s*=\s*([^|\r\n]+)", description, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def _configure_source_semantics(self) -> None:
+        samples = int(getattr(self._page, "samplesperpixel", 1) or 1)
+        bit_depth = int(np.dtype(self._page.dtype).itemsize * 8)
+        compression = int(getattr(self._page, "compression", 1) or 1)
+        self.modality = "brightfield"
+        self.native_fields = (0,)
+        self.native_channel_count = 0
+        self.native_z_count = 1
+        self.native_t_count = 1
+        self.source_channel_count = samples
+        self.source_bit_depth = bit_depth
+        self.channel_metadata: list[dict[str, Any]] = []
+        self.supports_native_planes = False
+        self.supports_plane_jpeg_passthrough = False
+        self.source_container = "svs" if self.path.suffix.lower() == ".svs" else "tiff"
+        self.source_version = None
+        self.source_codec = "JPEG" if compression in JPEG_COMPRESSION_IDS else str(self._page.compression.name)
+        self.native_axes = "YXS" if samples > 1 else "YX"
+        self.compatibility_level = "static_unverified"
+        self.mpp_x = 0.0
+        self.mpp_y = 0.0
+        self.tile_size = int(getattr(self._page, "tilewidth", 0) or 256)
+        self._field_series = [self._tif.series[0]]
+        self._associated_series = {
+            str(getattr(series, "name", "") or "").strip().lower(): series
+            for series in self._tif.series
+            if str(getattr(series, "name", "") or "").strip()
+        }
+
+        if self._tif.ome_metadata:
+            self._configure_ome_semantics(self._tif.ome_metadata)
+        else:
+            self._configure_aperio_semantics(self._page.description or "")
+
+        if self.modality == "fluorescence":
+            first_series = self._field_series[0]
+            self.level_dimensions = [
+                (
+                    int(level.shape[level.axes.index("X")]),
+                    int(level.shape[level.axes.index("Y")]),
+                )
+                for level in first_series.levels
+            ]
+            self.levels = [TiffNativeLevel(dimensions) for dimensions in self.level_dimensions]
+            self.supports_native_pyramid = len(self.levels) > 1
+            self.supports_native_planes = True
+            self.supports_plane_jpeg_passthrough = (
+                self.source_bit_depth == 8
+                and all(
+                    int(page.compression) in JPEG_COMPRESSION_IDS
+                    and int(getattr(page, "samplesperpixel", 1) or 1) == 1
+                    and bool(getattr(page, "is_tiled", False))
+                    and int(getattr(page, "tilewidth", 0) or 0) == self.tile_size
+                    and int(getattr(page, "tilelength", 0) or 0) == self.tile_size
+                    and getattr(page, "jpegtables", None) is None
+                    for series in self._field_series
+                    for level in series.levels
+                    for page in level.pages
+                )
+            )
+
+    def _configure_ome_semantics(self, xml: str) -> None:
+        root = ET.fromstring(xml)
+        images = [element for element in root if element.tag.rsplit("}", 1)[-1] == "Image"]
+        associated_names = {"thumbnail", "macro", "label"}
+        main_images = [
+            image for image in images
+            if str(image.attrib.get("Name", "")).strip().lower() not in associated_names
+        ]
+        main_series = [
+            series for series in self._tif.series
+            if str(getattr(series, "name", "") or "").strip().lower() not in associated_names
+        ]
+        if not main_images or not main_series:
+            return
+        self.source_container = "ome_tiff"
+        image = main_images[0]
+        pixels = next((child for child in image if child.tag.rsplit("}", 1)[-1] == "Pixels"), None)
+        if pixels is None:
+            return
+        channels = [child for child in pixels if child.tag.rsplit("}", 1)[-1] == "Channel"]
+        samples_per_pixel = max((int(channel.attrib.get("SamplesPerPixel", "1")) for channel in channels), default=1)
+        description = next(
+            (child.text or "" for child in image if child.tag.rsplit("}", 1)[-1] == "Description"),
+            "",
+        )
+        self.mpp_x = float(pixels.attrib.get("PhysicalSizeX", "0") or 0)
+        self.mpp_y = float(pixels.attrib.get("PhysicalSizeY", "0") or 0)
+        explicit_fluorescence = "modality=fluorescence" in description.lower()
+        has_fluor = any(str(channel.attrib.get("Fluor", "")).strip() for channel in channels)
+        if samples_per_pixel >= 3 or int(getattr(self._page, "samplesperpixel", 1) or 1) >= 3:
+            self.modality = "brightfield"
+            self.native_channel_count = 0
+            return
+        if not explicit_fluorescence and not has_fluor:
+            self.modality = "unknown"
+            self.native_channel_count = int(pixels.attrib.get("SizeC", "1"))
+            return
+
+        self.modality = "fluorescence"
+        self.native_channel_count = int(pixels.attrib.get("SizeC", "1"))
+        self.native_z_count = int(pixels.attrib.get("SizeZ", "1"))
+        self.native_t_count = int(pixels.attrib.get("SizeT", "1"))
+        self.source_channel_count = self.native_channel_count
+        self.source_bit_depth = int(pixels.attrib.get("SignificantBits", str(self.source_bit_depth)))
+        self.native_axes = "TZCYX"
+        self._field_series = main_series[: len(main_images)]
+        self.native_fields = tuple(range(len(self._field_series)))
+        exposures: dict[int, float] = {}
+        for plane in (child for child in pixels if child.tag.rsplit("}", 1)[-1] == "Plane"):
+            if "ExposureTime" in plane.attrib:
+                exposures.setdefault(int(plane.attrib.get("TheC", "0")), float(plane.attrib["ExposureTime"]))
+        metadata: list[dict[str, Any]] = []
+        for index in range(self.native_channel_count):
+            channel = channels[index] if index < len(channels) else None
+            attrs = channel.attrib if channel is not None else {}
+            name = str(attrs.get("Name", "")).strip()
+            fluor = str(attrs.get("Fluor", "")).strip()
+            known = bool(fluor or (name and not re.fullmatch(r"Channel\s+\d+", name, re.IGNORECASE)))
+            metadata.append(
+                {
+                    "name": name,
+                    "fluor": fluor or None,
+                    "color": self._ome_color(attrs.get("Color")),
+                    "excitation_nm": float(attrs["ExcitationWavelength"]) if "ExcitationWavelength" in attrs else None,
+                    "emission_nm": float(attrs["EmissionWavelength"]) if "EmissionWavelength" in attrs else None,
+                    "exposure": exposures.get(index),
+                    "identity_source": "source_metadata" if known else "unknown",
+                }
+            )
+        self.channel_metadata = metadata
+
+    def _configure_aperio_semantics(self, description: str) -> None:
+        dye = self._description_property(description, "Dye")
+        monochrome = "JPEG/Monochrome" in description
+        if not dye or not monochrome:
+            return
+        self.modality = "fluorescence"
+        self.source_container = "fluorescence_svs"
+        self.native_channel_count = 1
+        self.source_channel_count = 1
+        self.native_axes = "TZCYX"
+        display_color = int(self._description_property(description, "DisplayColor") or "16777215")
+        known = re.fullmatch(r"C\d+", dye, re.IGNORECASE) is None
+        self.channel_metadata = [
+            {
+                "name": dye if known else "",
+                "fluor": dye if known else None,
+                "color": ((display_color >> 16) & 0xFF, (display_color >> 8) & 0xFF, display_color & 0xFF),
+                "excitation_nm": self._optional_description_float(description, "Excitation Wavelength"),
+                "emission_nm": self._optional_description_float(description, "Emission Wavelength"),
+                "exposure": self._optional_description_float(description, "Exposure Time"),
+                "identity_source": "source_metadata" if known else "unknown",
+            }
+        ]
+
+    def _optional_description_float(self, description: str, name: str) -> float | None:
+        value = self._description_property(description, name)
+        return float(value) if value is not None else None
+
     def _extract_mpp(self) -> float:
+        if self.mpp_x > 0 and self.mpp_y > 0:
+            return (self.mpp_x + self.mpp_y) / 2.0
+        if self.mpp_x > 0:
+            return self.mpp_x
+        if self.mpp_y > 0:
+            return self.mpp_y
         description = self._page.description or ""
         match = re.search(r"\bMPP\s*=\s*([0-9]+(?:\.[0-9]+)?)", description, re.IGNORECASE)
         if match:
@@ -241,6 +431,259 @@ class TiffSlideSource:
         return segment
 
     @staticmethod
+    def _page_dimensions(page) -> tuple[int, int]:
+        keyframe = page.keyframe
+        return int(keyframe.imagewidth), int(keyframe.imagelength)
+
+    @staticmethod
+    def _page_segment_geometry(page, index: int) -> tuple[int, int, int, int]:
+        width, height = TiffSlideSource._page_dimensions(page)
+        keyframe = page.keyframe
+        if keyframe.is_tiled:
+            tile_w = int(keyframe.tilewidth)
+            tile_h = int(keyframe.tilelength)
+            tiles_x = (width + tile_w - 1) // tile_w
+            x0 = (index % tiles_x) * tile_w
+            y0 = (index // tiles_x) * tile_h
+            return x0, y0, min(tile_w, width - x0), min(tile_h, height - y0)
+        rows_per_strip = int(getattr(keyframe, "rowsperstrip", 0) or height)
+        y0 = index * rows_per_strip
+        return 0, y0, width, min(rows_per_strip, height - y0)
+
+    @staticmethod
+    def _page_intersecting_segments(page, x: int, y: int, width: int, height: int) -> list[int]:
+        page_width, page_height = TiffSlideSource._page_dimensions(page)
+        x1 = min(page_width, x + width)
+        y1 = min(page_height, y + height)
+        if width <= 0 or height <= 0 or x >= x1 or y >= y1:
+            return []
+        keyframe = page.keyframe
+        if keyframe.is_tiled:
+            tile_w = int(keyframe.tilewidth)
+            tile_h = int(keyframe.tilelength)
+            tiles_x = (page_width + tile_w - 1) // tile_w
+            first_col = max(0, x // tile_w)
+            last_col = max(0, (x1 - 1) // tile_w)
+            first_row = max(0, y // tile_h)
+            last_row = max(0, (y1 - 1) // tile_h)
+            return [
+                row * tiles_x + column
+                for row in range(first_row, last_row + 1)
+                for column in range(first_col, last_col + 1)
+            ]
+        rows_per_strip = int(getattr(keyframe, "rowsperstrip", 0) or page_height)
+        first = max(0, y // rows_per_strip)
+        last = max(0, (y1 - 1) // rows_per_strip)
+        return list(range(first, last + 1))
+
+    def _resolved_page_data_offset(self, page, index: int) -> int:
+        offset = int(page.dataoffsets[index])
+        reader = getattr(self, "_shifted_reader", None)
+        if reader is None or int(page.keyframe.compression) not in JPEG_COMPRESSION_IDS:
+            return offset
+        shifted = offset + reader.delta
+        if shifted <= offset or shifted >= reader.size:
+            return offset
+        if reader.read_actual(offset, 3).startswith(b"\xff\xd8\xff"):
+            return offset
+        if reader.read_actual(shifted, 3).startswith(b"\xff\xd8\xff"):
+            return shifted
+        return offset
+
+    def _read_page_segment_bytes(self, page, index: int) -> bytes:
+        offset = self._resolved_page_data_offset(page, index)
+        byte_count = int(page.databytecounts[index])
+        reader = getattr(self, "_shifted_reader", None)
+        if reader is not None:
+            return reader.read_actual(offset, byte_count)
+        with self._tif.filehandle.lock:
+            self._tif.filehandle.seek(offset)
+            return self._tif.filehandle.read(byte_count)
+
+    @staticmethod
+    def _normalize_plane_array(array: np.ndarray) -> np.ndarray:
+        plane = np.asarray(array)
+        while plane.ndim > 2 and plane.shape[0] == 1:
+            plane = plane[0]
+        if plane.ndim == 3 and plane.shape[-1] == 1:
+            plane = plane[..., 0]
+        if plane.ndim != 2 or plane.dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            raise RuntimeError("暂不支持该 OME-TIFF 原生平面布局")
+        return np.ascontiguousarray(plane)
+
+    def _decode_page_segment(self, page, index: int) -> np.ndarray:
+        cache_key = (int(page.dataoffsets[0]), index)
+        cached = self._plane_segment_cache.get(cache_key)
+        if cached is not None:
+            self._plane_segment_cache.move_to_end(cache_key)
+            return cached
+        keyframe = page.keyframe
+        args: dict[str, Any] = {"_fullsize": bool(keyframe.is_tiled)}
+        if int(keyframe.compression) in JPEG_COMPRESSION_IDS:
+            args["jpegtables"] = page.jpegtables
+            args["jpegheader"] = keyframe.jpegheader
+        decoded, _indices, _shape = keyframe.decode(
+            self._read_page_segment_bytes(page, index),
+            index,
+            **args,
+        )
+        if decoded is None:
+            _x, _y, width, height = self._page_segment_geometry(page, index)
+            decoded = np.zeros((height, width), dtype=keyframe.dtype)
+        segment = self._normalize_plane_array(decoded)
+        self._plane_segment_cache[cache_key] = segment
+        self._plane_segment_cache.move_to_end(cache_key)
+        while len(self._plane_segment_cache) > self.cache_size:
+            self._plane_segment_cache.popitem(last=False)
+        return segment
+
+    @staticmethod
+    def _level_plane_page(level, channel_index: int, z_index: int, t_index: int):
+        coordinates = {"C": channel_index, "Z": z_index, "T": t_index}
+        page_index = 0
+        for axis, size in zip(level.axes, level.shape):
+            if axis in {"Y", "X", "S"}:
+                continue
+            coordinate = coordinates.get(axis, 0)
+            if coordinate < 0 or coordinate >= int(size):
+                raise IndexError(f"OME-TIFF {axis} 轴索引越界")
+            page_index = page_index * int(size) + coordinate
+        if page_index >= len(level.pages):
+            raise IndexError("OME-TIFF 平面索引越界")
+        return level.pages[page_index]
+
+    def _native_plane_page(
+        self,
+        level_index: int,
+        field_index: int,
+        channel_index: int,
+        z_index: int,
+        t_index: int,
+    ):
+        if field_index < 0 or field_index >= len(self._field_series):
+            raise IndexError("OME-TIFF Field 索引越界")
+        series = self._field_series[field_index]
+        if level_index < 0 or level_index >= len(series.levels):
+            raise IndexError("OME-TIFF 金字塔层索引越界")
+        if channel_index < 0 or channel_index >= self.native_channel_count:
+            raise IndexError("OME-TIFF 通道索引越界")
+        if z_index < 0 or z_index >= self.native_z_count:
+            raise IndexError("OME-TIFF Z 索引越界")
+        if t_index < 0 or t_index >= self.native_t_count:
+            raise IndexError("OME-TIFF T 索引越界")
+        return self._level_plane_page(series.levels[level_index], channel_index, z_index, t_index)
+
+    def read_level_field_plane_region(
+        self,
+        level_index: int,
+        field_index: int,
+        channel_index: int,
+        z_index: int,
+        t_index: int,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        page = self._native_plane_page(
+            level_index,
+            field_index,
+            channel_index,
+            z_index,
+            t_index,
+        )
+        page_width, page_height = self._page_dimensions(page)
+        region = np.zeros((height, width), dtype=page.keyframe.dtype)
+        if width <= 0 or height <= 0:
+            return region
+        request_x0 = max(0, x)
+        request_y0 = max(0, y)
+        request_x1 = min(page_width, x + width)
+        request_y1 = min(page_height, y + height)
+        if request_x0 >= request_x1 or request_y0 >= request_y1:
+            return region
+        for index in self._page_intersecting_segments(
+            page,
+            request_x0,
+            request_y0,
+            request_x1 - request_x0,
+            request_y1 - request_y0,
+        ):
+            segment_x, segment_y, segment_width, segment_height = self._page_segment_geometry(page, index)
+            ix0 = max(request_x0, segment_x)
+            iy0 = max(request_y0, segment_y)
+            ix1 = min(request_x1, segment_x + segment_width)
+            iy1 = min(request_y1, segment_y + segment_height)
+            if ix0 >= ix1 or iy0 >= iy1:
+                continue
+            segment = self._decode_page_segment(page, index)
+            source_x = ix0 - segment_x
+            source_y = iy0 - segment_y
+            target_x = ix0 - x
+            target_y = iy0 - y
+            copy_width = ix1 - ix0
+            copy_height = iy1 - iy0
+            region[target_y : target_y + copy_height, target_x : target_x + copy_width] = segment[
+                source_y : source_y + copy_height,
+                source_x : source_x + copy_width,
+            ]
+        return region
+
+    def read_level_plane_region(
+        self,
+        level_index: int,
+        channel_index: int,
+        z_index: int,
+        t_index: int,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        return self.read_level_field_plane_region(
+            level_index,
+            0,
+            channel_index,
+            z_index,
+            t_index,
+            x,
+            y,
+            width,
+            height,
+        )
+
+    def iter_native_level_plane_jpegs(
+        self,
+        level_index: int,
+        channel_index: int,
+        z_index: int,
+        t_index: int,
+        field_index: int | None = None,
+    ):
+        selected_field = 0 if field_index is None else field_index
+        page = self._native_plane_page(
+            level_index,
+            selected_field,
+            channel_index,
+            z_index,
+            t_index,
+        )
+        keyframe = page.keyframe
+        if (
+            not keyframe.is_tiled
+            or int(keyframe.compression) not in JPEG_COMPRESSION_IDS
+            or int(getattr(keyframe, "samplesperpixel", 1) or 1) != 1
+            or keyframe.dtype != np.dtype(np.uint8)
+            or getattr(keyframe, "jpegtables", None) is not None
+        ):
+            raise RuntimeError("当前 TIFF 平面不能直接重封装为 JPEG 瓦片")
+        for index in range(len(page.dataoffsets)):
+            payload = self._read_page_segment_bytes(page, index)
+            if not payload.startswith(b"\xff\xd8") or payload.find(b"\xff\xc0") < 0:
+                raise RuntimeError("TIFF JPEG 瓦片不是完整的 8-bit baseline JPEG")
+            yield payload
+
+    @staticmethod
     def _normalize_array(array: np.ndarray) -> np.ndarray:
         arr = np.asarray(array)
         if arr.dtype != np.uint8:
@@ -309,8 +752,20 @@ class TiffSlideSource:
         pixels = int(page.imagewidth) * int(page.imagelength)
         if pixels > max_pixels:
             return None
-        array = self._normalize_array(page.asarray())
-        return Image.fromarray(array)
+        array = np.asarray(page.asarray())
+        while array.ndim > 3 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim == 3 and array.shape[-1] == 1:
+            array = array[..., 0]
+        if array.ndim == 2 and array.dtype in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            return Image.fromarray(array)
+        return Image.fromarray(self._normalize_array(array))
+
+    def _named_associated_image(self, name: str) -> Image.Image | None:
+        series = self._associated_series.get(name)
+        if series is None or not series.pages:
+            return None
+        return self._page_to_image(series.pages[0])
 
     def _smallest_tiled_page(self):
         candidates = [
@@ -340,6 +795,9 @@ class TiffSlideSource:
         return self._preview_image.copy()
 
     def get_thumbnail_image(self) -> Image.Image | None:
+        named = self._named_associated_image("thumbnail")
+        if named is not None:
+            return named
         for page in self._tif.pages[1:]:
             desc = (page.description or "").lower()
             if "label " in desc or "macro " in desc:
@@ -359,6 +817,9 @@ class TiffSlideSource:
         return self.get_preview_image()
 
     def get_label_image(self) -> Image.Image | None:
+        named = self._named_associated_image("label")
+        if named is not None:
+            return named
         for page in self._tif.pages[1:]:
             desc = (page.description or "").lower()
             if "label " not in desc:
@@ -369,6 +830,9 @@ class TiffSlideSource:
         return None
 
     def get_macro_image(self) -> Image.Image | None:
+        named = self._named_associated_image("macro")
+        if named is not None:
+            return named
         for page in self._tif.pages[1:]:
             desc = (page.description or "").lower()
             if "macro " not in desc and "native macro" not in desc:

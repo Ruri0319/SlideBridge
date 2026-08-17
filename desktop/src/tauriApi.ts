@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import type { ConversionEvent, ConversionRequest } from "./types";
+import type { ConversionEvent, ConversionRequest, InspectionRequest } from "./types";
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -30,6 +30,11 @@ export async function startConversion(request: ConversionRequest): Promise<void>
     throw new Error("Tauri runtime is not available. Use npm run tauri dev for conversions.");
   }
   await invoke("start_conversion", { request });
+}
+
+export async function startInspection(request: InspectionRequest): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("start_inspection", { request });
 }
 
 export async function cancelConversion(): Promise<void> {

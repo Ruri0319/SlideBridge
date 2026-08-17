@@ -3,5 +3,4 @@ Pillow>=10.0,<12
 tifffile>=2024.8.0,<2027
 imagecodecs>=2026.3.6,<2027
 psutil>=6.0,<8
-pyvips[binary]>=3.0,<4
 pyinstaller>=6.10,<7

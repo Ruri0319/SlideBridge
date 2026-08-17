@@ -9,6 +9,7 @@ from unittest import mock
 import numpy as np
 
 from ibl2svs.tiff_source import TiffSlideSource, _recover_shifted_ifd
+from ibl2svs.inspection import inspect_file
 
 
 TIFFFILE_AVAILABLE = importlib.util.find_spec("tifffile") is not None
@@ -27,6 +28,24 @@ def _rgb_fixture(width: int = 40, height: int = 35) -> np.ndarray:
 
 @unittest.skipUnless(TIFFFILE_AVAILABLE, "tifffile is required for TIFF source tests")
 class TiffSlideSourceTests(unittest.TestCase):
+    def test_rgb_ome_tiff_is_brightfield_without_fluorescence_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "he.ome.tif"
+            tifffile.imwrite(
+                path,
+                _rgb_fixture(16, 16),
+                ome=True,
+                photometric="rgb",
+                metadata={"axes": "YXS"},
+            )
+
+            inspection = inspect_file(path)
+
+        self.assertEqual(inspection.source_modality, "brightfield")
+        self.assertEqual(inspection.source_container, "ome_tiff")
+        self.assertEqual(inspection.channel_count, 0)
+        self.assertEqual(inspection.channel_definitions, ())
+
     def test_tiled_rgb_read_region_uses_segments_not_page_asarray(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "tiled.tif"

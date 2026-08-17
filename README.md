@@ -2,7 +2,7 @@
 
 [![Release](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Ruri0319/SlideBridge/actions/workflows/release.yml)
 
-**镜渡 SlideBridge** 是一个通用病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb/.kfbl/.kfbf/.kfba/.kfbx`、`.image`、`.svs`、`.tif/.tiff` 批量转换为标准 **Aperio SVS** 或 **Generic Pyramidal TIFF (BigTIFF)**。
+**镜渡 SlideBridge** 是一个通用病理 Whole-Slide Image (WSI) 转换工具，用于把 `.ibl`、`.kfb/.kfbl/.kfbf/.kfba/.kfbx`、`.image`、`.svs`、`.tif/.tiff`、`.afi` 批量转换为 **Pyramidal OME-TIFF**、明场 **Aperio SVS**、单通道荧光 SVS 或 AFI 文件集。
 
 项目包含两层入口：
 
@@ -28,17 +28,20 @@ open /Applications/SlideBridge.app
 
 ## 支持格式
 
-| 输入 | 输出 Generic TIFF | 输出 SVS | 说明 |
-|----|----|----|----|
-| `.ibl` | 支持 | 支持 | 读取厂商 IBL SQLite/tile 数据 |
-| `.kfb/.kfbl/.kfbf/.kfba/.kfbx` | 支持 | 支持 | 按内容签名识别；仅 KFBF 2.1 RGB/JPEG 有真实样本验证 |
-| `.image` | 支持 | 支持 | 读取已验证的私有 JPEG 瓦片金字塔结构 |
-| `.svs` | 支持 | 不适用 | SVS 转 Generic Pyramidal TIFF |
-| `.tif/.tiff` | 不适用 | 支持 | Generic TIFF 转 Aperio-compatible SVS |
+| 输入数据 | OME-TIFF | 明场 SVS | 荧光 SVS | AFI |
+|----|----:|----:|----:|----:|
+| 明场 / HE | 支持 | 支持 | 禁止 | 禁止 |
+| 8-bit、C=1、Field/Z/T=1 荧光 | 支持 | 禁止 | 支持 | 支持 |
+| 8-bit、C>1、Field/Z/T=1 荧光 | 支持 | 禁止 | 禁止 | 支持 |
+| 高位深或多 Field/Z/T 荧光 | 支持 | 禁止 | 禁止 | 禁止 |
 
-KFB 家族会按容器签名和版本读取原生金字塔。Generic TIFF 对可直通的 JPEG tile 保留原始压缩数据；多字段、多通道或高位深数据会同时写出可阅片 RGB 金字塔和 OME 原始 series。SVS 保持 Aperio 布局，并明确报告未保存的额外原始平面。除 KFBF 2.1 RGB/JPEG 外，其余 KFB 路径会标记为 `static_unverified`；未知布局会明确失败，不会套用旧偏移继续转换。
+程序会在转换前异步预检文件头，显示模态、C/Z/T/Field、位深、codec、通道定义来源及每种输出格式的兼容数量。未知通道默认按 C1/C2 编号，不根据通道数量、像素颜色、扩展名或文件名猜测 DAPI、AF 等染料。用户可在当前任务中覆盖通道名称、显示色和可选波长；覆盖只影响输出元数据与 AFI 文件名，不改变像素。
 
-`.image` 支持会优先保留厂家原生资源：解析 64 位资源偏移和 8 级列优先索引，Generic TIFF 直接写出原生金字塔层，SVS 从最接近的厂家层生成兼容页面；thumbnail、macro、label 以原始尺寸写出。主层 JPEG 需要轴转置，若运行环境提供 `jpegtran`（或将其路径放入 `IBL2SVS_JPEGTRAN`），会使用 DCT 域无损转置，否则回退到高质量重编码并在转换结果中标记。机构、病例号、设备号和扫描时间会作为扫描 metadata 读取，但不会原样写回厂商私有结构。
+OME-TIFF 会读取 OME-XML 中的 Channel、Fluor、Color、波长和曝光；单通道荧光 SVS 会读取 Aperio `Dye`、`DisplayColor` 和曝光字段；AFI 会按 XML 中的相对 Path 组合通道，并在目录预检时自动排除其已引用的子 SVS，避免重复转换。明场 HE/RGB 文件不显示荧光通道定义。
+
+KFB 家族按内容签名识别真实容器和版本。当前真实 KFBF 2.1 灰度 JPEG 样本可从厂家 Header 识别 DAPI、蓝色显示色、曝光信息和 16 层原生金字塔；其他 KFB/KFBA/KFBX 路径在没有真实样本前标记为 `static_unverified`。未知版本或布局会明确失败，不会套用固定偏移猜测转换。荧光输出会保留到首个不大于 2×2 tile 的有效概览层，忽略 1×1、1×3 等会破坏 QuPath 自动显示范围的厂家占位层；报告仍记录完整源层尺寸。
+
+`.image` 会优先保留厂家原生资源：解析 64 位资源偏移和 8 级列优先索引，OME-TIFF 直接写出原生金字塔层，明场 SVS 从最接近的厂家层生成兼容页面；thumbnail、macro、label 以原始尺寸写出。主层 JPEG 需要轴转置，若运行环境提供 `jpegtran`（或将其路径放入 `IBL2SVS_JPEGTRAN`），会使用 DCT 域无损转置，否则使用高质量重编码并在转换结果中标记。
 
 ## 快速开始
 
@@ -62,7 +65,7 @@ python -m pip install -r requirements.txt
 ```python
 from ibl2svs import ConvertOptions, convert_file
 
-result = convert_file("sample.ibl", "output.tif", ConvertOptions())
+result = convert_file("sample.ibl", "output.ome.tif", ConvertOptions(output_format="ome_tiff"))
 print(result.success, result.duration_sec)
 ```
 
@@ -77,18 +80,34 @@ result = convert_file(
 print(result.success, result.backend)
 ```
 
+预检和荧光 AFI：
+
+```python
+from ibl2svs import ConvertOptions, convert_file, inspect_file
+
+inspection = inspect_file("sample.kfbf")
+print(inspection.source_modality, inspection.allowed_output_formats)
+
+result = convert_file(
+    "sample.kfbf",
+    "output.afi",
+    ConvertOptions(output_format="afi"),
+)
+print(result.output_files)
+```
+
 ## 桌面端架构
 
 ```text
 React / TypeScript UI
   |
-  |- Tauri commands: start_conversion / cancel_conversion / worker_status
+  |- Tauri commands: start_inspection / start_conversion / cancel_conversion / worker_status
   |- Tauri plugins: dialog / opener / shell
   v
 Python sidecar: slidebridge-worker
   |
-  |- stdin: JSON Lines start / cancel / ping
-  |- stdout: JSON Lines ready / log / progress / done / error
+  |- stdin: JSON Lines inspect / start / cancel / ping
+  |- stdout: JSON Lines inspection_* / log / progress / done / error
   v
 ibl2svs.converter.convert_folder()
 ```
@@ -100,27 +119,42 @@ ibl2svs.converter.convert_folder()
 
 ## 输出格式
 
-### Generic TIFF (`.tif`)
+### Pyramidal OME-TIFF (`.ome.tif`)
 
-- 密集金字塔，逐级 2x 降采样直至短边 < 512 px。
-- JPEG tile，默认 `256x256`，质量 `90`。
-- BigTIFF 容器，支持超大文件。
-- 兼容 OpenSlide / QuPath / Bio-Formats。
+- 始终使用 BigTIFF 和 SubIFD；缩小层不再作为并列顶层页面。
+- 明场主 Image 为 uint8 RGB `YXS`；可直通的厂家 JPEG 保留原始压缩数据。
+- 荧光只保存原始 `TZCYX` 通道平面，每个 Field 是独立 OME Image，并保留原始 dtype、SignificantBits、物理尺寸和通道元数据。
+- 可直通的完整原生 JPEG 保持字节不变；尺寸不足一个标准 tile 的厂家 JPEG 会补背景并重新编码为完整 tile，避免 Bio-Formats/QuPath 在低倍率产生条纹。
+- thumbnail、macro、label 是独立命名 OME Image，使用 LZW 无损压缩。
 
-### SVS (`.svs`)
+### 明场 SVS (`.svs`)
 
-- Aperio-compatible SVS。
-- Classic TIFF 默认行为。
-- 主图、缩略图、动态金字塔、label、macro 页面。
-- RGB Adobe JPEG tile + JPEGTables 共享表。
-- OpenSlide / QuPath 兼容。
+- 保留原有 Aperio-compatible 写出后端、240×240 JPEG 瓦片、质量设置和页面布局。
+- 仅接受明场输入；不会把荧光通道合成为明场 SVS。
+
+### 单通道荧光 SVS (`.svs`)
+
+- 仅接受 8-bit、C=1、Field/Z/T=1 且具有独立灰度原生平面的荧光输入。
+- 256×256 灰度 JPEG 瓦片；满足条件时直接重封装原始 JPEG。
+- 金字塔停止在可用于稳定直方图统计的概览层，避免 QuPath 用 1×1、1×3 占位层把显示窗错误收窄。
+- ImageDescription 写入 Dye、DisplayColor、MPP、AppMag 及源文件存在的曝光/波长。
+
+### AFI (`.afi` + `.svs`)
+
+- AFI 是一个 UTF-8 XML 和一组完整单通道荧光 SVS 的文件集。
+- 单通道也可生成 AFI，例如 `sample.afi` + `sample_C01_DAPI.svs`。
+- 整套文件先写临时文件并全部验证，成功后统一发布；失败或取消不会留下残缺文件集。
 
 ## 项目结构
 
 ```text
 ibl2svs/
-├── backend_worker.py    # Python sidecar JSONL worker
+├── backend_worker.py    # Python sidecar JSONL 预检/转换 worker
 ├── converter.py         # 文件扫描、单/批量转换、CSV 报告
+├── inspection.py        # 模态、通道和输出资格预检
+├── ome_tiff_writer.py   # Pyramidal OME-TIFF 写出
+├── fluorescence_svs_writer.py # 单通道荧光 SVS
+├── afi_writer.py        # AFI 文件集事务写出
 ├── kfb_source.py        # KFB JPEG 瓦片读取源
 ├── punuoxi_source.py    # 私有 .image JPEG 金字塔读取源
 ├── models.py            # ConvertOptions / ConvertResult / BatchResult
@@ -197,7 +231,6 @@ Python:
 | `tifffile` | TIFF/SVS 读写 |
 | `imagecodecs` | JPEG 编码/解码 |
 | `psutil` | 内存与 CPU 监控 |
-| `pyvips[binary]` | Generic TIFF 可选后端 |
 | `pyinstaller` | Python sidecar 打包 |
 
 Desktop:
@@ -213,6 +246,8 @@ Desktop:
 
 - GitHub Actions 会对 macOS 应用进行完整的 ad-hoc 签名和校验；要消除首次启动安全提示，仍需补充 Apple Developer ID 签名和 notarization。
 - KFB 解析目前覆盖当前已验证的 KFB 结构；不同厂商或不同版本 KFB 可能需要进一步适配。
+- AFI 与荧光 SVS 只承担 8-bit 二维阅片交换；高位深、多 Field/Z/T 数据必须使用 OME-TIFF。
+- Bio-Formats 仅用于开发验收，不作为运行时依赖或随软件分发。
 - Tauri app 不依赖用户本机 Python，但构建机需要 Python、Node.js、Rust 和 PyInstaller。
 
 ## 许可证

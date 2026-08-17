@@ -35,6 +35,15 @@ class IBLSlide:
             }
             self._block_cache: OrderedDict[int, np.ndarray] = OrderedDict()
             self.base_info = self._load_base_info()
+            self.modality = "brightfield"
+            self.native_fields = (0,)
+            self.native_channel_count = 1
+            self.native_z_count = 1
+            self.native_t_count = 1
+            self.source_channel_count = 3
+            self.source_bit_depth = 8
+            self.channel_metadata = []
+            self.supports_native_planes = False
             self.blocks = self._load_blocks()
             self.blocks_by_grid = {(block.grid_col, block.grid_row): block for block in self.blocks}
             self.blocks_by_id = {block.block_id: block for block in self.blocks}

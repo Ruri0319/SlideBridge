@@ -2,9 +2,18 @@
 
 ## Unreleased
 
+- Generic TIFF 输出升级为 Pyramidal OME-TIFF：始终使用 BigTIFF + SubIFD，并以 `.ome.tif` 为固定后缀。
+- 新增荧光原始 `TZCYX` OME 写出、多 Field 独立 Image、通道名称/颜色/波长/曝光与 SignificantBits 元数据。
+- 新增 256×256 单通道荧光 SVS，以及事务式 AFI（XML + 多个单通道 SVS）文件集输出。
+- 新增转换前批量预检、输出兼容数量、未知通道确认、任务级通道覆盖、混合批次兼容文件筛选与 skipped 报告。
+- KFBF 2.1 Header 通道数组使用完整 64 位位置解引用；当前真实样本识别为 DAPI、蓝色显示色、曝光 85。
+- 预检后文件变化或通道覆盖结构不匹配时明确停止，不继续使用陈旧定义。
 - `.image` 原生保真转换：支持 64 位瓦片偏移、原生 8 级金字塔以及 thumbnail、macro、label RGB 资源。
-- Generic TIFF 保留原生 256×256 JPEG 瓦片和无损附属页；SVS 从厂家金字塔层独立生成兼容页面。
+- OME-TIFF 保留原生 256×256 JPEG 瓦片和无损附属 Image；明场 SVS 从厂家金字塔层独立生成兼容页面。
+- 修复 KFBF 荧光 OME-TIFF、SVS 和 AFI 在 QuPath 中严重过曝：不再暴露 1×1、1×3 等占位层作为自动直方图来源。
+- 修复厂家短 JPEG 被直接写入固定 256×256 tile 后在低倍率右侧产生条纹；完整瓦片继续字节直通，短瓦片补零后规范化写出。
 - 增加 JPEG DCT 域无损轴转置路径；缺少 `jpegtran` 时自动使用高质量重编码并记录转换模式。
+- 修复大型 `.image` 写出 OME-TIFF 时首层长期无进度、ETA 持续增加的问题；无损 JPEG 转置改为有序并行，并按瓦片持续汇报进度。
 - 支持 KFBF（`.kfbf`）切片变体：识别 `KFBF` 文件头和间接 JPEG 瓦片指针。
 
 ## 0.4.5
@@ -75,4 +84,3 @@
 - 真实 `.ibl` 的最终验收需在本地 Windows 环境完成
 - 不处理标注迁移
 - 不做断点续转和并行转换
-- pyvips/libvips 为 Generic TIFF 可选依赖（未安装时回退到 tifffile 路径）

@@ -61,7 +61,7 @@ class AcceptanceSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample, img_width=1024, img_height=1024, tile_width=256, tile_height=256)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))

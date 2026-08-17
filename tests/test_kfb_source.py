@@ -61,6 +61,28 @@ class KfbSlideSourceTests(unittest.TestCase):
             np.testing.assert_allclose(region[3, 0], [140, 150, 160], atol=3)
             np.testing.assert_allclose(region[3, 4], [200, 210, 220], atol=3)
 
+    def test_reads_classic_kfbf_channel_pointer_arrays(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "fluorescence.kfbf"
+            create_sample_kfb(
+                path,
+                variant="kfbf",
+                fluorescence_channel=("DAPI", (0, 0, 255), 85.0),
+            )
+
+            with KfbSlideSource(path) as source:
+                self.assertEqual(source.modality, "fluorescence")
+                self.assertTrue(source.supports_native_planes)
+                self.assertEqual(source.native_channel_count, 1)
+                self.assertEqual(source.source_axes, "TZCYX")
+                self.assertEqual(source.channel_metadata[0]["name"], "DAPI")
+                self.assertEqual(source.channel_metadata[0]["vendor_channel_id"], "1")
+                self.assertEqual(source.channel_metadata[0]["color"], (0, 0, 255))
+                self.assertEqual(source.channel_metadata[0]["exposure"], 85.0)
+                plane = source.read_level_plane_region(0, 0, 0, 0, 0, 0, 8, 8)
+
+            self.assertEqual(plane.shape, (8, 8))
+
     def test_returns_associated_images(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.kfb"

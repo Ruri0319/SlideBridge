@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -139,6 +140,15 @@ class PunuoxiImageSource:
             self.width = self._header_width
             self.height = self._header_height
             self.channels = 3
+            self.modality = "brightfield"
+            self.native_fields = (0,)
+            self.native_channel_count = 1
+            self.native_z_count = 1
+            self.native_t_count = 1
+            self.source_channel_count = 3
+            self.source_bit_depth = 8
+            self.channel_metadata = []
+            self.supports_native_planes = False
             self.tile_size = TILE_SIZE
             self.level_dimensions = [level.dimensions for level in self._levels]
             self.level_grids = [(level.columns, level.rows) for level in self._levels]
@@ -509,10 +519,11 @@ class PunuoxiImageSource:
             transformed, mode = transpose_jpeg(blob)
         except Exception as exc:
             raise PunuoxiFormatError(f"IMAGE JPEG 瓦片方向转换失败: {record.index}") from exc
-        if self._native_tile_mode == "uninitialized":
-            self._native_tile_mode = mode
-        elif self._native_tile_mode != mode:
-            self._native_tile_mode = "mixed"
+        with self._lock:
+            if self._native_tile_mode == "uninitialized":
+                self._native_tile_mode = mode
+            elif self._native_tile_mode != mode:
+                self._native_tile_mode = "mixed"
         return transformed, mode
 
     def read_region(
@@ -623,6 +634,37 @@ class PunuoxiImageSource:
         for record in self._levels[level_index].records:
             encoded, _mode = self._encoded_level_tile(record)
             yield encoded
+
+    def iter_native_level_jpegs_parallel(
+        self,
+        level_index: int,
+        *,
+        workers: int,
+        cancel_event=None,
+    ):
+        if level_index < 0 or level_index >= len(self._levels):
+            raise IndexError(f"IMAGE 金字塔层索引越界: {level_index}")
+        if workers <= 1:
+            yield from self.iter_native_level_jpegs(level_index)
+            return
+
+        records = iter(self._levels[level_index].records)
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-jpeg-transpose") as executor:
+            for _ in range(workers * 2):
+                record = next(records, None)
+                if record is None:
+                    break
+                pending.append(executor.submit(self._encoded_level_tile, record))
+
+            while pending:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("转换已取消")
+                encoded, _mode = pending.popleft().result()
+                yield encoded
+                record = next(records, None)
+                if record is not None:
+                    pending.append(executor.submit(self._encoded_level_tile, record))
 
     def _select_preview_level(self, max_long_side: int = 2048) -> PunuoxiLevel:
         for level in self._levels[1:]:

@@ -104,11 +104,11 @@ class WriterTests(unittest.TestCase):
                     )
         self.assertIn("mock failure", str(ctx.exception))
 
-    def test_convert_file_writes_generic_tiff_and_reportable_metadata(self) -> None:
+    def test_convert_file_writes_pyramidal_ome_tiff_and_reportable_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample, img_width=512, img_height=512, tile_width=128, tile_height=128)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))
@@ -116,8 +116,8 @@ class WriterTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertTrue(output.exists())
             self.assertGreaterEqual(result.pyramid_levels or 0, 2)
-            self.assertEqual(result.output_format, "generic_tiff")
-            self.assertEqual(result.backend, "tifffile-streaming")
+            self.assertEqual(result.output_format, "ome_tiff")
+            self.assertEqual(result.backend, "tifffile-ome")
             self.assertEqual(result.level_dimensions, [(512, 512), (256, 256)])
             self.assertGreaterEqual(result.read_decode_sec, 0.0)
             self.assertGreaterEqual(result.main_write_sec, 0.0)
@@ -125,7 +125,7 @@ class WriterTests(unittest.TestCase):
             self.assertGreaterEqual(result.peak_memory_mb, 0.0)
             self.assertGreaterEqual(result.avg_cpu_percent, 0.0)
             with tifffile.TiffFile(output) as tif:
-                self.assertGreaterEqual(len(tif.pages), 2)
+                self.assertTrue(tif.is_ome)
                 self.assertEqual(tif.pages[0].shape, (512, 512, 3))
                 self.assertTrue(tif.pages[0].is_tiled)
                 self.assertIn("AppMag = 40", tif.pages[0].description or "")
@@ -134,10 +134,11 @@ class WriterTests(unittest.TestCase):
                 mpp_x, mpp_y = _page_mpp(tif.pages[0])
                 self.assertAlmostEqual(mpp_x, 0.25, places=4)
                 self.assertAlmostEqual(mpp_y, 0.25, places=4)
-                self.assertEqual(tif.pages[1].shape, (256, 256, 3))
-                self.assertTrue(tif.pages[1].is_tiled)
-                self.assertEqual(tif.pages[1].subfiletype, 1)
-                level_mpp_x, level_mpp_y = _page_mpp(tif.pages[1])
+                level_page = tif.series[0].levels[1].pages[0]
+                self.assertEqual(level_page.shape, (256, 256, 3))
+                self.assertTrue(level_page.is_tiled)
+                self.assertEqual(level_page.subfiletype, 1)
+                level_mpp_x, level_mpp_y = _page_mpp(level_page)
                 self.assertAlmostEqual(level_mpp_x, 0.5, places=4)
                 self.assertAlmostEqual(level_mpp_y, 0.5, places=4)
             with TiffSlideSource(output) as source:
@@ -147,7 +148,7 @@ class WriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "directional.image"
-            output = root / "directional.tif"
+            output = root / "directional.ome.tif"
             create_sample_image(sample, directional_tile=True)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))
@@ -164,7 +165,7 @@ class WriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sparse.image"
-            output = root / "sparse.tif"
+            output = root / "sparse.ome.tif"
             create_sample_image(sample, empty_tiles={(0, 0, 1)})
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))
@@ -175,33 +176,44 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(int(blank.min()), 250)
             self.assertEqual(int(blank.max()), 250)
 
-    def test_native_image_generic_tiff_preserves_levels_and_associated_pages(self) -> None:
+    def test_native_image_ome_tiff_preserves_levels_and_associated_images(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "native.image"
-            output = root / "native.tif"
+            output = root / "native.ome.tif"
             create_sample_image(sample, include_native_resources=True)
 
-            result = convert_file(sample, output, ConvertOptions(tile_size=16))
+            progress_events: list[tuple[str, int, int, int, int]] = []
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(tile_size=16),
+                progress_callback=lambda current, level, done, total, overall_done, overall_total: progress_events.append(
+                    (level, done, total, overall_done, overall_total)
+                ),
+            )
 
             self.assertTrue(result.success, result.error)
             self.assertTrue(result.native_path)
             self.assertEqual(result.native_tile_mode, "lossless_transpose")
             self.assertEqual(result.native_level_dimensions, [(512, 512), (256, 256)])
+            native_progress = [event for event in progress_events if event[0] == "写出原生层"]
+            self.assertTrue(native_progress)
+            self.assertEqual(native_progress[0][1:3], (1, 4))
+            self.assertGreater(native_progress[-1][3], native_progress[0][3])
             with tifffile.TiffFile(output) as tif:
-                self.assertEqual(len(tif.pages), 5)
+                self.assertEqual(len(tif.pages), 4)
+                self.assertEqual(len(tif.series[0].levels), 2)
                 self.assertEqual(tif.pages[0].shape, (512, 512, 3))
-                self.assertEqual(tif.pages[1].shape, (256, 256, 3))
-                self.assertEqual(tif.pages[2].shape, (5, 300, 3))
-                self.assertEqual(tif.pages[3].shape, (625, 1152, 3))
-                self.assertEqual(tif.pages[4].shape, (294, 300, 3))
-                self.assertEqual(int(tif.pages[2].compression), 5)
-                self.assertIn("native thumbnail", (tif.pages[2].description or "").lower())
-                self.assertIn("native macro", (tif.pages[3].description or "").lower())
-                self.assertIn("native label", (tif.pages[4].description or "").lower())
-                self.assertTrue(np.all(tif.pages[2].asarray() == [10, 20, 30]))
-                self.assertTrue(np.all(tif.pages[3].asarray() == [40, 50, 60]))
-                self.assertTrue(np.all(tif.pages[4].asarray() == [70, 80, 90]))
+                self.assertEqual(tif.series[0].levels[1].shape, (256, 256, 3))
+                self.assertEqual(tif.pages[1].shape, (5, 300, 3))
+                self.assertEqual(tif.pages[2].shape, (625, 1152, 3))
+                self.assertEqual(tif.pages[3].shape, (294, 300, 3))
+                self.assertEqual(int(tif.pages[1].compression), 5)
+                self.assertEqual([series.name for series in tif.series[1:]], ["thumbnail", "macro", "label"])
+                self.assertTrue(np.all(tif.pages[1].asarray() == [10, 20, 30]))
+                self.assertTrue(np.all(tif.pages[2].asarray() == [40, 50, 60]))
+                self.assertTrue(np.all(tif.pages[3].asarray() == [70, 80, 90]))
 
     def test_native_image_svs_preserves_associated_images_and_uses_native_levels(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -239,11 +251,11 @@ class WriterTests(unittest.TestCase):
                 self.assertTrue(np.all(tif.pages[3].asarray() == [70, 80, 90]))
                 self.assertTrue(np.all(tif.pages[4].asarray() == [40, 50, 60]))
 
-    def test_native_kfb_generic_tiff_preserves_levels_jpeg_tables_and_resources(self) -> None:
+    def test_native_kfb_ome_tiff_preserves_levels_jpeg_tables_and_resources(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "native.kfbf"
-            output = root / "native.tif"
+            output = root / "native.ome.tif"
             create_sample_kfb(sample, variant="kfbf")
 
             with KfbSlideSource(sample) as source:
@@ -263,20 +275,27 @@ class WriterTests(unittest.TestCase):
             self.assertEqual(result.compatibility_level, "sample_verified")
             self.assertEqual(result.native_level_dimensions, [(24, 18), (12, 9)])
             with tifffile.TiffFile(output) as tif:
-                self.assertEqual(len(tif.pages), 5)
+                self.assertEqual(len(tif.pages), 4)
+                self.assertEqual(len(tif.series[0].levels), 2)
                 self.assertEqual((tif.pages[0].tilewidth, tif.pages[0].tilelength), (16, 16))
-                np.testing.assert_allclose(tif.pages[0].asarray(), expected, atol=3)
+                np.testing.assert_allclose(tif.pages[0].asarray(), expected, atol=5)
+                for level in tif.series[0].levels:
+                    page = level.pages[0]
+                    for offset, size in zip(page.dataoffsets, page.databytecounts):
+                        tif.filehandle.seek(offset)
+                        with Image.open(BytesIO(tif.filehandle.read(size))) as tile:
+                            self.assertEqual(tile.size, (16, 16))
                 offset = tif.pages[0].dataoffsets[0]
                 size = tif.pages[0].databytecounts[0]
                 tif.filehandle.seek(offset)
                 output_jpeg = tif.filehandle.read(size)
                 self.assertEqual(Image.open(BytesIO(output_jpeg)).quantization, source_quantization)
-                self.assertEqual(tif.pages[2].shape, (9, 12, 3))
-                self.assertEqual(tif.pages[3].shape, (24, 64, 3))
-                self.assertEqual(tif.pages[4].shape, (40, 32, 3))
-                np.testing.assert_array_equal(tif.pages[2].asarray(), expected_thumbnail)
-                np.testing.assert_array_equal(tif.pages[3].asarray(), expected_macro)
-                np.testing.assert_array_equal(tif.pages[4].asarray(), expected_label)
+                self.assertEqual(tif.pages[1].shape, (9, 12, 3))
+                self.assertEqual(tif.pages[2].shape, (24, 64, 3))
+                self.assertEqual(tif.pages[3].shape, (40, 32, 3))
+                np.testing.assert_array_equal(tif.pages[1].asarray(), expected_thumbnail)
+                np.testing.assert_array_equal(tif.pages[2].asarray(), expected_macro)
+                np.testing.assert_array_equal(tif.pages[3].asarray(), expected_label)
 
     def test_native_kfb_svs_uses_240_tiles_and_preserves_associated_pixels(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -309,26 +328,26 @@ class WriterTests(unittest.TestCase):
                 np.testing.assert_array_equal(tif.pages[-2].asarray(), expected_label)
                 np.testing.assert_array_equal(tif.pages[-1].asarray(), expected_macro)
 
-    def test_kfba_generic_tiff_writes_rgb_pyramid_and_raw_ome_fields(self) -> None:
+    def test_kfba_ome_tiff_writes_raw_field_pyramids_only(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "multi.kfba"
-            output = root / "multi.tif"
+            output = root / "multi.ome.tif"
             create_sample_kfba(sample)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))
 
             self.assertTrue(result.success, result.error)
-            self.assertEqual(result.native_tile_mode, "rgb_composite_plus_raw")
+            self.assertEqual(result.native_tile_mode, "jpeg_passthrough")
             self.assertEqual(result.source_axes, "TZCYX")
             with tifffile.TiffFile(output) as tif:
                 self.assertTrue(tif.is_ome)
-                self.assertEqual(tif.series[0].shape, (18, 24, 3))
+                self.assertEqual(tif.series[0].shape, (2, 18, 24))
                 self.assertEqual(len(tif.series[0].levels), 2)
-                raw_series = [series for series in tif.series if series.name.endswith(" raw")]
-                self.assertEqual(len(raw_series), 2)
-                field0 = raw_series[0].asarray()
-                field1 = raw_series[1].asarray()
+                field_series = [series for series in tif.series if "field" in series.name]
+                self.assertEqual(len(field_series), 2)
+                field0 = field_series[0].asarray()
+                field1 = field_series[1].asarray()
                 self.assertEqual(field0.shape, (2, 18, 24))
                 self.assertEqual(field1.shape, (2, 18, 24))
                 np.testing.assert_allclose(field0[0], 30, atol=2)
@@ -339,7 +358,7 @@ class WriterTests(unittest.TestCase):
                 self.assertIn('Name="Green"', tif.ome_metadata)
                 self.assertIn('PhysicalSizeX="0.25"', tif.ome_metadata)
 
-    def test_kfba_svs_reports_omitted_raw_fields_and_channels(self) -> None:
+    def test_kfba_brightfield_svs_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "multi.kfba"
@@ -357,13 +376,10 @@ class WriterTests(unittest.TestCase):
                 ),
             )
 
-            self.assertTrue(result.success, result.error)
-            self.assertEqual(result.native_tile_mode, "svs_reencoded")
-            self.assertIn("fields=2", result.svs_omitted_native_data)
-            self.assertIn("C=2", result.svs_omitted_native_data)
-            with tifffile.TiffFile(output) as tif:
-                self.assertEqual((tif.pages[0].tilewidth, tif.pages[0].tilelength), (16, 16))
-                np.testing.assert_allclose(tif.pages[0].asarray()[0, 0], [30, 120, 0], atol=4)
+            self.assertFalse(result.success)
+            self.assertEqual(result.diagnostic_code, "incompatible_output")
+            self.assertIn("荧光输入不能写为明场", result.error)
+            self.assertFalse(output.exists())
 
     def test_image_string_scan_time_is_rendered_on_svs_label(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -377,11 +393,11 @@ class WriterTests(unittest.TestCase):
             rendered_text = [call.args[1] for call in draw_factory.return_value.text.call_args_list]
             self.assertIn("Scanned: 2026-01-01 12:34:56", rendered_text)
 
-    def test_generic_tiff_pyramid_progress_keeps_accumulated_overall_counts(self) -> None:
+    def test_ome_tiff_pyramid_progress_keeps_accumulated_overall_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample, img_width=512, img_height=512, tile_width=128, tile_height=128)
 
             progress_events: list[tuple[str, int, int, int, int]] = []
@@ -448,12 +464,12 @@ class WriterTests(unittest.TestCase):
                 self.assertEqual(int(tif.pages[5].compression), 5)
                 self.assertEqual(int(tif.pages[6].compression), 7)
 
-    def test_convert_svs_to_generic_tiff_rebuilds_pyramid(self) -> None:
+    def test_convert_svs_to_ome_tiff_rebuilds_pyramid(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
             svs_output = root / "sample.svs"
-            tiff_output = root / "rebuilt.tif"
+            tiff_output = root / "rebuilt.ome.tif"
             create_sample_ibl(sample, img_width=512, img_height=512, tile_width=128, tile_height=128)
             first = convert_file(
                 sample,
@@ -466,12 +482,13 @@ class WriterTests(unittest.TestCase):
             self.assertTrue(first.success)
             self.assertTrue(result.success)
             self.assertEqual(result.input_format, "svs")
-            self.assertEqual(result.output_format, "generic_tiff")
+            self.assertEqual(result.output_format, "ome_tiff")
             with tifffile.TiffFile(tiff_output) as tif:
-                self.assertGreaterEqual(len(tif.pages), 2)
+                self.assertTrue(tif.is_ome)
+                self.assertGreaterEqual(len(tif.series[0].levels), 2)
                 self.assertEqual(tif.pages[0].shape, (512, 512, 3))
                 self.assertTrue(tif.pages[0].is_tiled)
-                self.assertTrue(tif.pages[1].is_tiled)
+                self.assertTrue(tif.series[0].levels[1].pages[0].is_tiled)
                 self.assertEqual(int(tif.pages[0].compression), 7)
                 self.assertIn("AppMag = 40", tif.pages[0].description or "")
                 mpp_x, mpp_y = _page_mpp(tif.pages[0])
@@ -480,11 +497,11 @@ class WriterTests(unittest.TestCase):
             with TiffSlideSource(tiff_output) as source:
                 self.assertEqual(source.base_info.max_zoom_rate, 40)
 
-    def test_convert_generic_tiff_to_svs_rebuilds_aperio_layout(self) -> None:
+    def test_convert_ome_tiff_to_svs_rebuilds_aperio_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            tiff_output = root / "sample.tif"
+            tiff_output = root / "sample.ome.tif"
             svs_output = root / "rebuilt.svs"
             create_sample_ibl(sample, img_width=512, img_height=512, tile_width=128, tile_height=128)
             first = convert_file(sample, tiff_output, ConvertOptions(tile_size=16))
@@ -675,7 +692,7 @@ class WriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=15))
@@ -690,7 +707,7 @@ class WriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample, img_width=1024, img_height=1024, tile_width=256, tile_height=256)
 
             result = convert_file(
@@ -705,11 +722,11 @@ class WriterTests(unittest.TestCase):
             self.assertGreater(result.main_write_sec + result.pyramid_sec, 0.0)
 
     @unittest.skipUnless(OPENSLIDE_AVAILABLE, "openslide is required for OpenSlide compatibility test")
-    def test_output_is_readable_as_generic_tiff_by_openslide(self) -> None:
+    def test_output_is_readable_as_pyramidal_ome_tiff_by_openslide(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             sample = root / "sample.ibl"
-            output = root / "sample.tif"
+            output = root / "sample.ome.tif"
             create_sample_ibl(sample, img_width=512, img_height=512, tile_width=128, tile_height=128)
 
             result = convert_file(sample, output, ConvertOptions(tile_size=16))

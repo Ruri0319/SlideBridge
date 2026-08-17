@@ -348,17 +348,21 @@ class KfbSlideSource:
         self.default_field_index = 0
         self.default_channel_index = 0
         self.channel_metadata: list[dict[str, object]] = []
+        self.modality = "unknown"
+        self.supports_native_planes = False
         self.composite_mode = 1
         self.native_axes = "YXS"
         self.source_channel_count = 3
         self.source_bit_depth = 8
         self.source_codec = ""
+        self.supports_plane_jpeg_passthrough = False
         self.compatibility_level = "static_unverified"
         self.diagnostic_code: str | None = None
         self.diagnostic_stage: str | None = None
         try:
             self._file_size = self.path.stat().st_size
             self._dispatch_container()
+            self._finalize_source_semantics()
         except Exception:
             self.close()
             raise
@@ -475,6 +479,30 @@ class KfbSlideSource:
             self._parse_kfbx()
             return
         raise self._error("不是可识别的江丰容器", code="unknown_container", stage="detect")
+
+    def _finalize_source_semantics(self) -> None:
+        packed_samples = int(self.source_channel_count)
+        has_channel_directory = bool(self.channel_metadata)
+        tile_channels = {tile.channel_index for tile in self._tiles}
+        independent_planes = (
+            self.native_channel_count >= 1
+            and tile_channels == set(range(self.native_channel_count))
+            and (self.native_channel_count > 1 or packed_samples == 1)
+        )
+        if has_channel_directory and independent_planes:
+            self.modality = "fluorescence"
+            self.supports_native_planes = True
+            self.native_axes = "TZCYX"
+        elif packed_samples >= 3:
+            self.modality = "brightfield"
+            self.supports_native_planes = False
+            self.native_channel_count = 1
+            self.native_axes = "YXS"
+        else:
+            self.modality = "unknown"
+            self.supports_native_planes = False
+            self.native_axes = "YX"
+        self.base_info = self._build_base_info()
 
     def _parse_kfbx(self) -> None:
         first_attribute_offset = _u64(self._read_at(68, 8), 0)
@@ -783,7 +811,7 @@ class KfbSlideSource:
             packed_components = first_decoded.shape[2] if first_decoded.ndim == 3 else 1
             self.source_bit_depth = first_decoded.dtype.itemsize * 8
         else:
-            _marker, _precision, packed_components = _jpeg_layout(first_payload)
+            marker, precision, packed_components = _jpeg_layout(first_payload)
         if self.native_channel_count > 1 and packed_components != 1:
             raise self._error(
                 "KFBA 多通道 payload 无法映射到原始 C 轴",
@@ -802,6 +830,12 @@ class KfbSlideSource:
             and self.source_bit_depth == 8
             and packed_components in {1, 3}
         )
+        self.supports_plane_jpeg_passthrough = (
+            tiles[0].codec == "JPEG"
+            and marker == 0xC0
+            and precision == 8
+            and packed_components == 1
+        ) if tiles[0].codec != "JXL" else False
         self.native_axes = "TZCYX" if self.requires_raw_ome else ("YX" if packed_components == 1 else "YXS")
         self.compatibility_level = "static_unverified"
         self.base_info = self._build_base_info()
@@ -828,12 +862,15 @@ class KfbSlideSource:
                     stage="kfba_metadata",
                 )
 
+        vendor_ids = self._header_items[76]
         names = self._header_items[77]
         equipment = self._header_items[78]
         colors = self._header_items[79]
         exposures = self._header_items[84]
         self.channel_metadata = []
         for channel_index in range(channel_count):
+            vendor_id_blob = vendor_ids[channel_index * 20 : (channel_index + 1) * 20]
+            vendor_id = vendor_id_blob.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
             name_blob = names[channel_index * 40 : (channel_index + 1) * 40]
             name = name_blob.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             color = struct.unpack_from("<iii", colors, channel_index * 12)
@@ -846,9 +883,12 @@ class KfbSlideSource:
             self.channel_metadata.append(
                 {
                     "name": name or f"Channel {channel_index + 1}",
+                    "fluor": name or None,
+                    "vendor_channel_id": vendor_id or None,
                     "equipment_channel": _i32(equipment, channel_index * 4),
                     "color": tuple(int(component) for component in color),
                     "exposure": struct.unpack_from("<d", exposures, channel_index * 8)[0],
+                    "identity_source": "source_metadata" if name else "unknown",
                     "enabled": True,
                     "contrast": 1.0,
                     "brightness": 0.0,
@@ -863,7 +903,8 @@ class KfbSlideSource:
     @property
     def requires_raw_ome(self) -> bool:
         return (
-            len(self.native_fields) > 1
+            self.modality == "fluorescence"
+            or len(self.native_fields) > 1
             or self.native_channel_count > 1
             or self.native_z_count > 1
             or self.native_t_count > 1
@@ -914,6 +955,7 @@ class KfbSlideSource:
         header = self._read_at(0, metadata_end)
         self._header_items = _parse_header_items(header, 0x5C, metadata_end)
         self._metadata = _parse_metadata(header, 0x5C, metadata_end)
+        self._parse_classic_channel_metadata()
         self._parse_associated_images()
         self._tiles = self._parse_tile_index(version_value)
         self._build_levels()
@@ -932,6 +974,74 @@ class KfbSlideSource:
             else "static_unverified"
         )
         self.base_info = self._build_base_info()
+
+    def _parse_classic_channel_metadata(self) -> None:
+        count_blob = self._header_items.get(75)
+        if count_blob is None:
+            return
+        if len(count_blob) != 4:
+            raise self._error(
+                "KFBF Header 的通道数量 DataItem 75 无效",
+                code="kfbf_channel_metadata_invalid",
+                stage="kfbf_metadata",
+            )
+        channel_count = _u32(count_blob, 0)
+        if channel_count <= 0:
+            raise self._error(
+                "KFBF Header 的通道数量无效",
+                code="kfbf_channel_metadata_invalid",
+                stage="kfbf_metadata",
+            )
+
+        item_sizes = {76: 20, 77: 40, 78: 4, 79: 12, 84: 8}
+        values: dict[int, bytes] = {}
+        for item_id, item_size in item_sizes.items():
+            pointer = self._header_items.get(item_id)
+            if pointer is None or len(pointer) != 8:
+                raise self._error(
+                    f"KFBF Header 缺少有效通道指针 DataItem {item_id}",
+                    code="kfbf_channel_metadata_invalid",
+                    stage="kfbf_metadata",
+                )
+            values[item_id] = self._read_at(_u64(pointer, 0), channel_count * item_size)
+
+        vendor_ids = values[76]
+        names = values[77]
+        equipment = values[78]
+        colors = values[79]
+        exposures = values[84]
+        self.channel_metadata = []
+        for channel_index in range(channel_count):
+            vendor_id_blob = vendor_ids[channel_index * 20 : (channel_index + 1) * 20]
+            vendor_id = vendor_id_blob.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+            name_blob = names[channel_index * 40 : (channel_index + 1) * 40]
+            name = name_blob.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+            color = struct.unpack_from("<iii", colors, channel_index * 12)
+            if any(component < 0 or component > 255 for component in color):
+                raise self._error(
+                    f"KFBF 通道 {channel_index} RGB 颜色无效",
+                    code="kfbf_channel_metadata_invalid",
+                    stage="kfbf_metadata",
+                )
+            self.channel_metadata.append(
+                {
+                    "name": name or f"Channel {channel_index + 1}",
+                    "fluor": name or None,
+                    "vendor_channel_id": vendor_id or None,
+                    "equipment_channel": _i32(equipment, channel_index * 4),
+                    "color": tuple(int(component) for component in color),
+                    "exposure": struct.unpack_from("<d", exposures, channel_index * 8)[0],
+                    "identity_source": "source_metadata" if name else "unknown",
+                    "enabled": True,
+                    "contrast": 1.0,
+                    "brightness": 0.0,
+                    "channel_offset": 0.0,
+                    "gamma": 1.0,
+                    "black": 0.0,
+                    "white": 255.0,
+                }
+            )
+        self.native_channel_count = channel_count
 
     def _parse_associated_record(self, offset: int, name: str) -> KfbAssociatedImageRecord:
         head = self._read_at(offset, IMAGE_RECORD_SIZE)
@@ -1123,6 +1233,7 @@ class KfbSlideSource:
             self.source_bit_depth = precision
             self.source_channel_count = components
             self._can_passthrough_jpeg = marker == 0xC0 and precision == 8 and components in {1, 3}
+            self.supports_plane_jpeg_passthrough = marker == 0xC0 and precision == 8 and components == 1
         else:
             try:
                 import imagecodecs
@@ -1133,6 +1244,7 @@ class KfbSlideSource:
             self.source_bit_depth = decoded.dtype.itemsize * 8
             self.source_channel_count = decoded.shape[2] if decoded.ndim == 3 else 1
             self._can_passthrough_jpeg = False
+            self.supports_plane_jpeg_passthrough = False
 
     def _build_base_info(self) -> BaseInfo:
         return BaseInfo(
@@ -1322,7 +1434,7 @@ class KfbSlideSource:
 
         level = self._levels[level_index]
         dtype = np.uint16 if self.source_bit_depth > 8 else np.uint8
-        background = 0 if self.native_channel_count > 1 else self.base_info.background_color
+        background = 0 if self.modality == "fluorescence" else self.base_info.background_color
         region = np.full((height, width), background, dtype=dtype)
         request_x0 = max(0, x)
         request_y0 = max(0, y)
@@ -1424,6 +1536,48 @@ class KfbSlideSource:
                 )
                 yield None if tile is None else self._read_at(tile.offset, tile.length)
 
+    def iter_native_level_plane_jpegs(
+        self,
+        level_index: int,
+        channel_index: int,
+        z_index: int,
+        t_index: int,
+        field_index: int | None = None,
+    ) -> Iterator[bytes | None]:
+        if self.source_codec != "JPEG" or self.source_bit_depth != 8:
+            raise self._error(
+                "当前 KFB 平面不能直接重封装为 TIFF JPEG",
+                code="jpeg_passthrough_unavailable",
+                stage="write",
+            )
+        level = self._levels[level_index]
+        selected_field = self.default_field_index if field_index is None else field_index
+        tile_map = self._tile_maps[level_index]
+        for row in range(level.rows):
+            for column in range(level.columns):
+                tile = tile_map.get(
+                    (
+                        selected_field,
+                        column * self.tile_size,
+                        row * self.tile_size,
+                        channel_index,
+                        z_index,
+                        t_index,
+                    )
+                )
+                if tile is None:
+                    yield None
+                    continue
+                payload = self._read_at(tile.offset, tile.length)
+                marker, precision, components = _jpeg_layout(payload)
+                if marker != 0xC0 or precision != 8 or components != 1:
+                    raise self._error(
+                        "KFB 平面包含不能直接重封装的 JPEG 瓦片",
+                        code="jpeg_passthrough_unavailable",
+                        stage="write",
+                    )
+                yield payload
+
     def _associated_image(self, name: str) -> Image.Image | None:
         cached = self._associated_cache.get(name)
         if cached is not None:
@@ -1477,6 +1631,8 @@ class KfbSlideSource:
                 "sourceBitDepth": self.source_bit_depth,
                 "sourceChannelCount": self.source_channel_count,
                 "sourceAxes": self.native_axes,
+                "modality": self.modality,
+                "supportsNativePlanes": self.supports_native_planes,
                 "nativeFields": self.native_fields,
                 "nativeChannelCount": self.native_channel_count,
                 "nativeZCount": self.native_z_count,
