@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 from PIL import Image
 
-from ibl2svs.assembler import PILImageSource, iter_source_tiles
+from ibl2svs.assembler import DensePyramidDrive, PILImageSource, iter_source_tiles
 
 
 class AssemblerTests(unittest.TestCase):
+    def test_dense_pyramid_buffer_respects_memory_headroom(self) -> None:
+        slide = SimpleNamespace(width=100_000, height=100_000)
+        allocated_shapes: list[tuple[int, ...]] = []
+
+        def fake_zeros(shape, dtype):
+            allocated_shapes.append(shape)
+            return np.empty((1, 1, 3), dtype=dtype)
+
+        with mock.patch("ibl2svs.assembler.np.zeros", side_effect=fake_zeros):
+            drive = DensePyramidDrive(slide, 256, 1024, memory_budget_mb=1024)
+
+        requested_bytes = int(np.prod(allocated_shapes[0]))
+        self.assertLessEqual(requested_bytes, int(1024 * 0.55 * 1024 * 1024))
+        self.assertGreaterEqual(drive.downsample_factor, 8)
+
     def test_iter_source_tiles_preserves_global_row_major_order(self) -> None:
         image = np.zeros((16, 32, 3), dtype=np.uint8)
         tile_index = 1

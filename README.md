@@ -41,7 +41,7 @@ OME-TIFF 会读取 OME-XML 中的 Channel、Fluor、Color、波长和曝光；�
 
 KFB 家族按内容签名识别真实容器和版本。当前真实 KFBF 2.1 灰度 JPEG 样本可从厂家 Header 识别 DAPI、蓝色显示色、曝光信息和 16 层原生金字塔；其他 KFB/KFBA/KFBX 路径在没有真实样本前标记为 `static_unverified`。未知版本或布局会明确失败，不会套用固定偏移猜测转换。荧光输出会保留到首个不大于 2×2 tile 的有效概览层，忽略 1×1、1×3 等会破坏 QuPath 自动显示范围的厂家占位层；报告仍记录完整源层尺寸。
 
-`.image` 会优先保留厂家原生资源：解析 64 位资源偏移和 8 级列优先索引，OME-TIFF 直接写出原生金字塔层，明场 SVS 从最接近的厂家层生成兼容页面；thumbnail、macro、label 以原始尺寸写出。主层 JPEG 需要轴转置，若运行环境提供 `jpegtran`（或将其路径放入 `IBL2SVS_JPEGTRAN`），会使用 DCT 域无损转置，否则使用高质量重编码并在转换结果中标记。
+`.image` 会优先保留厂家原生资源：解析 64 位资源偏移和 8 级列优先索引，OME-TIFF 直接写出原生金字塔层，明场 SVS 从最接近的厂家层生成兼容页面；thumbnail、macro、label 以原始尺寸写出。主层 JPEG 需要轴转置，打包程序通过 libjpeg-turbo 的持久化 DCT 域转换器执行无损转置；开发环境可用 `IBL2SVS_TURBOJPEG` 指定动态库，动态库不可用或瓦片不满足无损条件时使用高质量重编码并在转换结果中标记。
 
 ## 快速开始
 
@@ -241,6 +241,7 @@ Desktop:
 | Tauri v2 | 桌面 shell |
 | Tauri dialog/opener/shell plugins | 目录选择、打开文件、sidecar |
 | lucide-react | 图标 |
+| Radix UI Select（MIT） | 跨平台荧光通道选择菜单 |
 
 ## 已知限制
 

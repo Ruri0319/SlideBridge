@@ -54,6 +54,22 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - name: Install libjpeg-turbo (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install jpeg-turbo
+          echo "IBL2SVS_TURBOJPEG=$(brew --prefix jpeg-turbo)/lib/libturbojpeg.dylib" >> "$GITHUB_ENV"
+
+      - name: Install libjpeg-turbo (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install libjpeg-turbo --no-progress -y
+          $dll = Get-ChildItem -Path 'C:\libjpeg-turbo64', 'C:\Program Files\libjpeg-turbo' -Filter turbojpeg.dll -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { throw 'turbojpeg.dll was not installed' }
+          "IBL2SVS_TURBOJPEG=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Prepare Rust toolchain
         shell: bash
         run: |
@@ -77,10 +93,15 @@ jobs:
           mkdir -p desktop/src-tauri/binaries
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp dist/slidebridge-worker.exe "desktop/src-tauri/binaries/slidebridge-worker-${target_triple}.exe"
+            archive_path="dist/slidebridge-worker.exe"
           else
             cp dist/slidebridge-worker "desktop/src-tauri/binaries/slidebridge-worker-${target_triple}"
             chmod +x "desktop/src-tauri/binaries/slidebridge-worker-${target_triple}"
+            archive_path="dist/slidebridge-worker"
           fi
+          archive_listing="$(pyi-archive_viewer -l "$archive_path")"
+          grep -qi turbojpeg <<< "$archive_listing"
+          grep -q THIRD_PARTY_NOTICES.md <<< "$archive_listing"
 
       - name: Install desktop dependencies
         working-directory: desktop

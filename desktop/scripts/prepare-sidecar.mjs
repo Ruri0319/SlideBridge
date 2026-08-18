@@ -74,10 +74,14 @@ function collectPythonSources(directory) {
 
 const buildInputs = [
   join(repoRoot, "SlideBridgeWorker.spec"),
+  join(repoRoot, "THIRD_PARTY_NOTICES.md"),
   join(repoRoot, "requirements.txt"),
   join(repoRoot, "worker_main.py"),
   ...collectPythonSources(join(repoRoot, "ibl2svs")),
 ];
+if (process.env.IBL2SVS_TURBOJPEG && existsSync(process.env.IBL2SVS_TURBOJPEG)) {
+  buildInputs.push(process.env.IBL2SVS_TURBOJPEG);
+}
 const newestInput = Math.max(...buildInputs.map((path) => statSync(path).mtimeMs));
 if (isNativeExecutable(workerTarget) && statSync(workerTarget).mtimeMs >= newestInput) {
   console.log(`prepare-sidecar: using current ${workerTarget}`);

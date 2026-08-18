@@ -354,10 +354,8 @@ class StripDownsampleDrive:
 class DensePyramidDrive:
     """Read IBL strips, yield main-page tiles, and accumulate a downsampled buffer.
 
-    Like *StripDownsampleDrive* but targets a 2× buffer by default for dense
-    pyramid generation.  When the 2× buffer would exceed the *memory_budget*
-    the class silently falls back to a 4× buffer so the cascade still fits in
-    the available RAM.
+    Like *StripDownsampleDrive* but targets the smallest power-of-two buffer
+    that fits the configured memory budget.
     """
 
     def __init__(
@@ -380,20 +378,17 @@ class DensePyramidDrive:
         self._stats = stats if stats is not None else {}
         self._notify = notify
 
-        # -- choose 2× or 4× accumulation target --
+        # -- choose the smallest power-of-two accumulation target that fits --
         w, h = slide.width, slide.height
-        two_x_mb = (max(1, w // 2) * max(1, h // 2) * 3) / (1024 * 1024)
-        four_x_mb = (max(1, w // 4) * max(1, h // 4) * 3) / (1024 * 1024)
         headroom_mb = memory_budget_mb * 0.55  # 55 % for the accumulation buffer
-
-        if two_x_mb <= headroom_mb:
-            self._ds = 2
-            self._buf_w = max(1, w // 2)
-            self._buf_h = max(1, h // 2)
-        else:
-            self._ds = 4
-            self._buf_w = max(1, w // 4)
-            self._buf_h = max(1, h // 4)
+        self._ds = 2
+        while True:
+            self._buf_w = max(1, (w + self._ds - 1) // self._ds)
+            self._buf_h = max(1, (h + self._ds - 1) // self._ds)
+            buffer_mb = (self._buf_w * self._buf_h * 3) / (1024 * 1024)
+            if buffer_mb <= headroom_mb or (self._buf_w == 1 and self._buf_h == 1):
+                break
+            self._ds *= 2
 
         self._buffer = np.zeros((self._buf_h, self._buf_w, 3), dtype=np.uint8)
         self.downsample_factor = self._ds

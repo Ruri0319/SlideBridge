@@ -83,6 +83,24 @@ class KfbSlideSourceTests(unittest.TestCase):
 
             self.assertEqual(plane.shape, (8, 8))
 
+    def test_classic_multichannel_metadata_without_plane_index_fails_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "unsupported.kfbf"
+            create_sample_kfb(
+                path,
+                variant="kfbf",
+                fluorescence_channel=[
+                    ("DAPI", (0, 0, 255), 10.0),
+                    ("FITC", (0, 255, 0), 20.0),
+                ],
+            )
+
+            with self.assertRaises(KfbFormatError) as raised:
+                KfbSlideSource(path)
+
+            self.assertEqual(raised.exception.diagnostic_code, "unsupported_layout")
+            self.assertEqual(raised.exception.diagnostic_stage, "index")
+
     def test_returns_associated_images(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "sample.kfb"

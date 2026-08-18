@@ -177,7 +177,11 @@ def create_sample_kfb(
     version: float | None = None,
     header_marker: bytes = b"\xf1\x01\xee\xee",
     compressed_index: bool = False,
-    fluorescence_channel: tuple[str, tuple[int, int, int], float] | None = None,
+    fluorescence_channel: (
+        tuple[str, tuple[int, int, int], float]
+        | list[tuple[str, tuple[int, int, int], float]]
+        | None
+    ) = None,
 ) -> None:
     if variant not in {"kfb", "kfbl", "kfbf"}:
         raise ValueError(f"unsupported KFB fixture variant: {variant}")
@@ -186,7 +190,12 @@ def create_sample_kfb(
     width = 24
     height = 18
     tile_size = 16
-    header_size = 512 if fluorescence_channel is not None else 220
+    fluorescence_channels = (
+        fluorescence_channel
+        if isinstance(fluorescence_channel, list)
+        else ([fluorescence_channel] if fluorescence_channel is not None else [])
+    )
+    header_size = 512 if fluorescence_channels else 220
     first_image_offset = header_size
 
     macro_blob = jpeg_bytes((230, 230, 230), (64, 24), quality=100)
@@ -211,7 +220,7 @@ def create_sample_kfb(
     for spec in tile_specs:
         blob = (
             _gray_jpeg_bytes(int(spec["color"][0]), (spec["width"], spec["height"]))
-            if fluorescence_channel is not None
+            if fluorescence_channels
             else jpeg_bytes(spec["color"], (spec["width"], spec["height"]), quality=100)
         )
         spec["blob"] = blob
@@ -264,27 +273,29 @@ def create_sample_kfb(
 
     device = b"TEST-KFB"
     metadata = bytearray()
-    if fluorescence_channel is None:
+    if not fluorescence_channels:
         metadata.extend(b"\xff\x01\xee\xee")
         metadata.extend(struct.pack("<I", 1))
         metadata.extend(struct.pack("<II", 29, len(device)))
         metadata.extend(device)
     else:
-        name, color, exposure = fluorescence_channel
         external_offset = 256
         channel_blobs = {
-            76: b"1\x00".ljust(20, b"\x00"),
-            77: name.encode("utf-8")[:39].ljust(40, b"\x00"),
-            78: struct.pack("<i", 1),
-            79: struct.pack("<iii", *color),
-            84: struct.pack("<d", exposure),
+            76: b"".join(
+                str(index + 1).encode("ascii").ljust(20, b"\x00")
+                for index in range(len(fluorescence_channels))
+            ),
+            77: b"".join(name.encode("utf-8")[:39].ljust(40, b"\x00") for name, _color, _exposure in fluorescence_channels),
+            78: struct.pack(f"<{len(fluorescence_channels)}i", *range(1, len(fluorescence_channels) + 1)),
+            79: b"".join(struct.pack("<iii", *color) for _name, color, _exposure in fluorescence_channels),
+            84: struct.pack(f"<{len(fluorescence_channels)}d", *(item[2] for item in fluorescence_channels)),
         }
         offsets: dict[int, int] = {}
         for item_id, blob in channel_blobs.items():
             offsets[item_id] = external_offset
             header[external_offset : external_offset + len(blob)] = blob
             external_offset += len(blob)
-        header_items = [(75, struct.pack("<I", 1))] + [
+        header_items = [(75, struct.pack("<I", len(fluorescence_channels)))] + [
             (item_id, struct.pack("<Q", offsets[item_id]))
             for item_id in (76, 77, 78, 79, 84)
         ]

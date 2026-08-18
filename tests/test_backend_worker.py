@@ -144,6 +144,24 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertEqual(event["type"], "log")
         self.assertEqual(event["message"], "hello")
 
+    def test_worker_protocol_error_keeps_inspection_job_id(self) -> None:
+        request = {
+            "type": "inspect",
+            "job_id": "inspect-missing",
+            "payload": {"input_dir": "/path/that/does/not/exist", "recursive": True},
+        }
+        output = io.StringIO()
+        worker = BackendWorker(
+            stdin=io.StringIO(json.dumps(request) + "\n"),
+            stdout=output,
+        )
+
+        worker.start()
+
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["type"], "inspection_error")
+        self.assertEqual(events[-1]["job_id"], "inspect-missing")
+
     def test_main_reads_utf8_windows_paths_from_a_gbk_stream(self) -> None:
         input_dir = r"F:\C4.STCH\冰冻测试"
         request = {
@@ -200,6 +218,30 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["job_id"], "job-1")
 
+    def test_conversion_state_is_idle_before_terminal_event(self) -> None:
+        worker = BackendWorker(stdin=io.StringIO(), stdout=io.StringIO())
+        batch = BatchResult(total_files=0, success_count=0, failed_count=0)
+        terminal_state: list[tuple[object, object, object]] = []
+        original_emit = worker.emit
+
+        def observe(event_type, **payload):
+            if event_type == "done":
+                terminal_state.append((worker._thread, worker._current_job_id, worker._current_job_kind))
+            original_emit(event_type, **payload)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            worker._thread = threading.current_thread()
+            worker._current_job_id = "job-1"
+            worker._current_job_kind = "conversion"
+            with (
+                mock.patch.object(worker, "emit", side_effect=observe),
+                mock.patch("ibl2svs.backend_worker.convert_folder", return_value=batch),
+            ):
+                worker._run_job("job-1", root, root, ConvertOptions())
+
+        self.assertEqual(terminal_state, [(None, None, None)])
+
     def test_worker_cancel_sets_cancel_event(self) -> None:
         output = io.StringIO()
         worker = BackendWorker(stdin=io.StringIO(), stdout=output)
@@ -218,7 +260,8 @@ class BackendWorkerTests(unittest.TestCase):
             root = Path(tempdir)
             inspection = BatchInspection(root, True, ())
 
-            def fake_inspect(input_dir, recursive, progress_callback):
+            def fake_inspect(input_dir, recursive, progress_callback, **kwargs):
+                kwargs["discovered_callback"](1, {"kfbf": 1})
                 progress_callback(0, 1, "sample.kfbf")
                 progress_callback(1, 1, "")
                 return inspection
@@ -238,7 +281,34 @@ class BackendWorkerTests(unittest.TestCase):
         events = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(events[0]["type"], "inspection_started")
         self.assertEqual([event["type"] for event in events].count("inspection_progress"), 2)
+        self.assertEqual([event["type"] for event in events].count("inspection_discovered"), 1)
         self.assertEqual(events[-1]["type"], "inspection_done")
+
+    def test_inspection_state_is_idle_before_terminal_event(self) -> None:
+        worker = BackendWorker(stdin=io.StringIO(), stdout=io.StringIO())
+        terminal_state: list[tuple[object, object, object]] = []
+        original_emit = worker.emit
+
+        def observe(event_type, **payload):
+            if event_type == "inspection_done":
+                terminal_state.append((worker._thread, worker._current_job_id, worker._current_job_kind))
+            original_emit(event_type, **payload)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            worker._thread = threading.current_thread()
+            worker._current_job_id = "inspect-1"
+            worker._current_job_kind = "inspection"
+            with (
+                mock.patch.object(worker, "emit", side_effect=observe),
+                mock.patch(
+                    "ibl2svs.backend_worker.inspect_inputs",
+                    return_value=BatchInspection(root, True, ()),
+                ),
+            ):
+                worker._run_inspection("inspect-1", root, True)
+
+        self.assertEqual(terminal_state, [(None, None, None)])
 
     def test_worker_rejects_inspection_while_busy(self) -> None:
         output = io.StringIO()
@@ -263,6 +333,54 @@ class BackendWorkerTests(unittest.TestCase):
         event = json.loads(output.getvalue())
         self.assertEqual(event["type"], "inspection_error")
         self.assertEqual(event["message"], "worker is busy")
+
+    def test_new_inspection_cancels_and_replaces_running_inspection(self) -> None:
+        output = io.StringIO()
+        worker = BackendWorker(stdin=io.StringIO(), stdout=output)
+        first_started = threading.Event()
+        second_done = threading.Event()
+
+        def fake_inspect(input_dir, recursive, cancel_event, **kwargs):
+            if Path(input_dir).name == "first":
+                first_started.set()
+                self.assertTrue(cancel_event.wait(timeout=2))
+                from ibl2svs.inspection import InspectionCancelled
+
+                raise InspectionCancelled("replaced")
+            second_done.set()
+            return BatchInspection(Path(input_dir), recursive, ())
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            with mock.patch("ibl2svs.backend_worker.inspect_inputs", side_effect=fake_inspect):
+                worker.start_inspection({
+                    "type": "inspect",
+                    "job_id": "inspect-first",
+                    "payload": {"input_dir": str(first), "recursive": True},
+                })
+                self.assertTrue(first_started.wait(timeout=2))
+                worker.start_inspection({
+                    "type": "inspect",
+                    "job_id": "inspect-second",
+                    "payload": {"input_dir": str(second), "recursive": True},
+                })
+                self.assertTrue(second_done.wait(timeout=2))
+                for _ in range(100):
+                    with worker._lock:
+                        active = worker._thread is not None
+                    if not active:
+                        break
+                    threading.Event().wait(0.01)
+
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        started_jobs = [event["job_id"] for event in events if event["type"] == "inspection_started"]
+        done_jobs = [event["job_id"] for event in events if event["type"] == "inspection_done"]
+        self.assertEqual(started_jobs, ["inspect-first", "inspect-second"])
+        self.assertEqual(done_jobs, ["inspect-second"])
 
 
 if __name__ == "__main__":

@@ -46,6 +46,78 @@ class TiffSlideSourceTests(unittest.TestCase):
         self.assertEqual(inspection.channel_count, 0)
         self.assertEqual(inspection.channel_definitions, ())
 
+    def test_standard_multichannel_ome_preserves_planes_without_fluor(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "channels.ome.tif"
+            planes = np.stack(
+                [
+                    np.full((16, 16), 25, dtype=np.uint8),
+                    np.full((16, 16), 175, dtype=np.uint8),
+                ]
+            )
+            tifffile.imwrite(
+                path,
+                planes,
+                ome=True,
+                tile=(16, 16),
+                metadata={
+                    "axes": "CYX",
+                    "Channel": {
+                        "Name": ["DAPI", "FITC"],
+                        "Color": [255, 16711935],
+                    },
+                },
+            )
+
+            inspection = inspect_file(path)
+            with TiffSlideSource(path) as source:
+                second = source.read_level_plane_region(0, 1, 0, 0, 0, 0, 8, 8)
+                associated = (
+                    source.get_thumbnail_image(),
+                    source.get_macro_image(),
+                    source.get_label_image(),
+                )
+
+        self.assertEqual(inspection.source_modality, "unknown")
+        self.assertEqual(inspection.channel_count, 2)
+        self.assertEqual([item.name for item in inspection.channel_definitions], ["DAPI", "FITC"])
+        np.testing.assert_array_equal(second, planes[1, :8, :8])
+        self.assertEqual(associated, (None, None, None))
+
+    def test_ome_units_are_normalized_to_internal_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "units.ome.tif"
+            tifffile.imwrite(
+                path,
+                np.zeros((16, 16), dtype=np.uint8),
+                ome=True,
+                tile=(16, 16),
+                metadata={
+                    "axes": "YX",
+                    "PhysicalSizeX": 250,
+                    "PhysicalSizeXUnit": "nm",
+                    "PhysicalSizeY": 0.00025,
+                    "PhysicalSizeYUnit": "mm",
+                    "Channel": {
+                        "Name": ["DAPI"],
+                        "ExcitationWavelength": [0.000000405],
+                        "ExcitationWavelengthUnit": ["m"],
+                        "EmissionWavelength": [461000],
+                        "EmissionWavelengthUnit": ["pm"],
+                    },
+                    "Plane": {"ExposureTime": [12], "ExposureTimeUnit": ["ms"]},
+                },
+            )
+
+            with TiffSlideSource(path) as source:
+                definitions = inspect_file(path).channel_definitions
+                mpp = source.base_info.mpp
+
+        self.assertAlmostEqual(mpp, 0.25)
+        self.assertAlmostEqual(definitions[0].excitation_nm or 0, 405.0)
+        self.assertAlmostEqual(definitions[0].emission_nm or 0, 461.0)
+        self.assertAlmostEqual(definitions[0].exposure or 0, 0.012)
+
     def test_tiled_rgb_read_region_uses_segments_not_page_asarray(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "tiled.tif"

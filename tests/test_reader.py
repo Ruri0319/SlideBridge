@@ -1,6 +1,7 @@
 from __future__ import annotations
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,18 @@ class ReaderTests(unittest.TestCase):
     def test_reader_rejects_incomplete_tiles(self) -> None:
         broken = Path(self.tempdir.name) / "broken.ibl"
         create_sample_ibl(broken, omit_tile=(3, 3))
+        with self.assertRaisesRegex(RuntimeError, "不完整"):
+            IBLSlide(broken)
+
+    def test_reader_rejects_block_with_no_full_resolution_tiles(self) -> None:
+        broken = Path(self.tempdir.name) / "missing-block.ibl"
+        create_sample_ibl(broken)
+        with sqlite3.connect(broken) as connection:
+            connection.execute(
+                "INSERT INTO tbl_img_info VALUES (?, 0, 0, 0, 0, 0, ?, ?, ?, ?)",
+                (1, 1, 0, 0, 0),
+            )
+
         with self.assertRaisesRegex(RuntimeError, "不完整"):
             IBLSlide(broken)
 

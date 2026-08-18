@@ -220,6 +220,39 @@ class FluorescenceOutputTests(unittest.TestCase):
             np.testing.assert_allclose(red, 30, atol=3)
             np.testing.assert_allclose(green, 120, atol=3)
 
+    def test_rewrites_standard_unknown_ome_without_losing_planes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sample = root / "standard.ome.tif"
+            planes = np.stack(
+                [
+                    np.full((16, 16), 35, dtype=np.uint8),
+                    np.full((16, 16), 145, dtype=np.uint8),
+                ]
+            )
+            tifffile.imwrite(
+                sample,
+                planes,
+                ome=True,
+                tile=(16, 16),
+                metadata={
+                    "axes": "CYX",
+                    "Channel": {"Name": ["DAPI", "FITC"], "Color": [255, 16711935]},
+                },
+            )
+
+            result = convert_file(sample, root / "rewritten.ome.tif", ConvertOptions(output_format="ome_tiff"))
+
+            self.assertTrue(result.success, result.error)
+            reopened = inspect_file(result.output_path)
+            self.assertEqual(reopened.source_modality, "unknown")
+            self.assertEqual(reopened.channel_count, 2)
+            with open_slide(result.output_path) as source:
+                first = source.read_level_plane_region(0, 0, 0, 0, 0, 0, 8, 8)
+                second = source.read_level_plane_region(0, 1, 0, 0, 0, 0, 8, 8)
+            np.testing.assert_array_equal(first, planes[0, :8, :8])
+            np.testing.assert_array_equal(second, planes[1, :8, :8])
+
     def test_writes_multichannel_afi_in_source_order(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

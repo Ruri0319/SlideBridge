@@ -13,11 +13,49 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image
 
+from .native_jpeg import jpeg_dimensions
+
 
 JPEG_COMPRESSION_IDS = {6, 7, 33007, 34892}
 PALETTE_PHOTOMETRIC = 3
 TIFF_HEADER_SIZE = 8
 IFD_SCAN_BYTES = 64 * 1024 * 1024
+
+
+def _ome_length(value: str | None, unit: str | None, target_unit: str) -> float:
+    if not value:
+        return 0.0
+    normalized = (unit or target_unit).strip().replace("μ", "µ").lower()
+    meters = {
+        "m": 1.0,
+        "cm": 1e-2,
+        "mm": 1e-3,
+        "µm": 1e-6,
+        "um": 1e-6,
+        "nm": 1e-9,
+        "pm": 1e-12,
+    }
+    target = target_unit.replace("μ", "µ").lower()
+    if normalized not in meters or target not in meters:
+        raise RuntimeError(f"不支持的 OME 长度单位: {unit}")
+    return float(value) * meters[normalized] / meters[target]
+
+
+def _ome_time(value: str | None, unit: str | None) -> float | None:
+    if value is None or value == "":
+        return None
+    normalized = (unit or "s").strip().replace("μ", "µ").lower()
+    seconds = {
+        "s": 1.0,
+        "ms": 1e-3,
+        "µs": 1e-6,
+        "us": 1e-6,
+        "ns": 1e-9,
+        "min": 60.0,
+    }
+    if normalized not in seconds:
+        raise RuntimeError(f"不支持的 OME 时间单位: {unit}")
+    return float(value) * seconds[normalized]
 
 
 @dataclass(frozen=True)
@@ -162,7 +200,9 @@ class TiffSlideSource:
         else:
             self._configure_aperio_semantics(self._page.description or "")
 
-        if self.modality == "fluorescence":
+        if (
+            self.source_container == "ome_tiff" and self.modality != "brightfield"
+        ) or self.modality == "fluorescence":
             first_series = self._field_series[0]
             self.level_dimensions = [
                 (
@@ -214,20 +254,23 @@ class TiffSlideSource:
             (child.text or "" for child in image if child.tag.rsplit("}", 1)[-1] == "Description"),
             "",
         )
-        self.mpp_x = float(pixels.attrib.get("PhysicalSizeX", "0") or 0)
-        self.mpp_y = float(pixels.attrib.get("PhysicalSizeY", "0") or 0)
+        self.mpp_x = _ome_length(
+            pixels.attrib.get("PhysicalSizeX"),
+            pixels.attrib.get("PhysicalSizeXUnit"),
+            "µm",
+        )
+        self.mpp_y = _ome_length(
+            pixels.attrib.get("PhysicalSizeY"),
+            pixels.attrib.get("PhysicalSizeYUnit"),
+            "µm",
+        )
         explicit_fluorescence = "modality=fluorescence" in description.lower()
         has_fluor = any(str(channel.attrib.get("Fluor", "")).strip() for channel in channels)
         if samples_per_pixel >= 3 or int(getattr(self._page, "samplesperpixel", 1) or 1) >= 3:
             self.modality = "brightfield"
             self.native_channel_count = 0
             return
-        if not explicit_fluorescence and not has_fluor:
-            self.modality = "unknown"
-            self.native_channel_count = int(pixels.attrib.get("SizeC", "1"))
-            return
-
-        self.modality = "fluorescence"
+        self.modality = "fluorescence" if explicit_fluorescence or has_fluor else "unknown"
         self.native_channel_count = int(pixels.attrib.get("SizeC", "1"))
         self.native_z_count = int(pixels.attrib.get("SizeZ", "1"))
         self.native_t_count = int(pixels.attrib.get("SizeT", "1"))
@@ -239,7 +282,10 @@ class TiffSlideSource:
         exposures: dict[int, float] = {}
         for plane in (child for child in pixels if child.tag.rsplit("}", 1)[-1] == "Plane"):
             if "ExposureTime" in plane.attrib:
-                exposures.setdefault(int(plane.attrib.get("TheC", "0")), float(plane.attrib["ExposureTime"]))
+                exposures.setdefault(
+                    int(plane.attrib.get("TheC", "0")),
+                    _ome_time(plane.attrib["ExposureTime"], plane.attrib.get("ExposureTimeUnit")),
+                )
         metadata: list[dict[str, Any]] = []
         for index in range(self.native_channel_count):
             channel = channels[index] if index < len(channels) else None
@@ -252,8 +298,24 @@ class TiffSlideSource:
                     "name": name,
                     "fluor": fluor or None,
                     "color": self._ome_color(attrs.get("Color")),
-                    "excitation_nm": float(attrs["ExcitationWavelength"]) if "ExcitationWavelength" in attrs else None,
-                    "emission_nm": float(attrs["EmissionWavelength"]) if "EmissionWavelength" in attrs else None,
+                    "excitation_nm": (
+                        _ome_length(
+                            attrs["ExcitationWavelength"],
+                            attrs.get("ExcitationWavelengthUnit"),
+                            "nm",
+                        )
+                        if "ExcitationWavelength" in attrs
+                        else None
+                    ),
+                    "emission_nm": (
+                        _ome_length(
+                            attrs["EmissionWavelength"],
+                            attrs.get("EmissionWavelengthUnit"),
+                            "nm",
+                        )
+                        if "EmissionWavelength" in attrs
+                        else None
+                    ),
                     "exposure": exposures.get(index),
                     "identity_source": "source_metadata" if known else "unknown",
                 }
@@ -679,8 +741,7 @@ class TiffSlideSource:
             raise RuntimeError("当前 TIFF 平面不能直接重封装为 JPEG 瓦片")
         for index in range(len(page.dataoffsets)):
             payload = self._read_page_segment_bytes(page, index)
-            if not payload.startswith(b"\xff\xd8") or payload.find(b"\xff\xc0") < 0:
-                raise RuntimeError("TIFF JPEG 瓦片不是完整的 8-bit baseline JPEG")
+            jpeg_dimensions(payload)
             yield payload
 
     @staticmethod
@@ -798,8 +859,10 @@ class TiffSlideSource:
         named = self._named_associated_image("thumbnail")
         if named is not None:
             return named
+        if self.source_container == "ome_tiff":
+            return None
         for page in self._tif.pages[1:]:
-            desc = (page.description or "").lower()
+            desc = (getattr(page, "description", "") or "").lower()
             if "label " in desc or "macro " in desc:
                 continue
             if ("thumbnail " in desc or "native thumbnail" in desc) and not getattr(page, "is_tiled", False):
@@ -807,7 +870,7 @@ class TiffSlideSource:
                 if image is not None:
                     return image.convert("RGB")
         for page in self._tif.pages[1:]:
-            desc = (page.description or "").lower()
+            desc = (getattr(page, "description", "") or "").lower()
             if "label " in desc or "macro " in desc:
                 continue
             if not getattr(page, "is_tiled", False):
@@ -820,8 +883,10 @@ class TiffSlideSource:
         named = self._named_associated_image("label")
         if named is not None:
             return named
+        if self.source_container == "ome_tiff":
+            return None
         for page in self._tif.pages[1:]:
-            desc = (page.description or "").lower()
+            desc = (getattr(page, "description", "") or "").lower()
             if "label " not in desc:
                 continue
             image = self._page_to_image(page)
@@ -833,8 +898,10 @@ class TiffSlideSource:
         named = self._named_associated_image("macro")
         if named is not None:
             return named
+        if self.source_container == "ome_tiff":
+            return None
         for page in self._tif.pages[1:]:
-            desc = (page.description or "").lower()
+            desc = (getattr(page, "description", "") or "").lower()
             if "macro " not in desc and "native macro" not in desc:
                 continue
             image = self._page_to_image(page)

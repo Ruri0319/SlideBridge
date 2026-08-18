@@ -1,17 +1,26 @@
+import * as Select from "@radix-ui/react-select";
 import {
+  Check,
+  CheckCircle2,
+  ChevronDown,
   ChevronRight,
+  CircleAlert,
   Folder,
+  LoaderCircle,
+  Minus,
   Moon,
   Play,
+  Plus,
   RotateCcw,
   Settings,
   Square,
   Sun,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   cancelConversion,
   chooseDirectory,
+  ensureWorker,
   getApplicationVersion,
   onConversionEvent,
   openFilesystemPath,
@@ -34,6 +43,7 @@ import type {
   InputInspection,
   OutputFormat,
   ProgressState,
+  TaskStatus,
   ThemeSettings,
   ViewKey,
 } from "./types";
@@ -48,7 +58,7 @@ type PhaseDisplayState = {
 
 const initialProgress: ProgressState = {
   running: false,
-  statusText: "Idle",
+  status: "idle",
   currentFile: "未选择任务",
   currentPhase: "待开始",
   stagePercent: 0,
@@ -63,6 +73,21 @@ const initialProgress: ProgressState = {
   reportPath: "",
   outputDir: "",
   startedAt: null,
+  finishedAt: null,
+  successCount: 0,
+  failedCount: 0,
+  skippedCount: 0,
+};
+
+const taskStatusLabels: Record<TaskStatus, string> = {
+  idle: "待机",
+  inspecting: "预检中",
+  ready: "就绪",
+  starting: "启动中",
+  running: "转换中",
+  success: "已完成",
+  error: "失败",
+  cancelled: "已取消",
 };
 
 function basename(path: string): string {
@@ -85,6 +110,13 @@ function formatEta(startedAt: number | null, percent: number): string {
   const hours = Math.floor(remainingSeconds / 3600);
   const minutes = Math.floor((remainingSeconds % 3600) / 60);
   return `${hours} 小时 ${minutes} 分`;
+}
+
+function formatDuration(startedAt: number | null, finishedAt: number | null): string {
+  if (!startedAt) return "—";
+  const seconds = Math.max(0, Math.round(((finishedAt ?? Date.now()) - startedAt) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
 function normalizePhase(value: string): string {
@@ -182,10 +214,16 @@ export default function App() {
   const [inspection, setInspection] = useState<BatchInspection | null>(null);
   const [inspectionStatus, setInspectionStatus] = useState<"idle" | "running" | "ready" | "error">("idle");
   const [inspectionMessage, setInspectionMessage] = useState("");
+  const [inspectionRevision, setInspectionRevision] = useState(0);
+  const [inspectionTotal, setInspectionTotal] = useState(0);
+  const [inspectionDone, setInspectionDone] = useState(0);
+  const [candidateFormatCounts, setCandidateFormatCounts] = useState<Record<string, number>>({});
+  const [partialInspectionFiles, setPartialInspectionFiles] = useState<InputInspection[]>([]);
   const [dialog, setDialog] = useState<"channels" | "compatibility" | null>(null);
   const [pendingOverrides, setPendingOverrides] = useState<Record<string, ChannelDefinition[]>>({});
   const themeResolution = useMemo(() => resolveTheme(themeSettings), [themeSettings]);
   const inspectionJob = useRef("");
+  const inspectionSequence = useRef(0);
   const fileProgressByPath = useRef<Map<string, number>>(new Map());
   const filePhaseByPath = useRef<Map<string, number>>(new Map());
   const completedFiles = useRef<Set<string>>(new Set());
@@ -194,6 +232,7 @@ export default function App() {
   const lastBatchPercent = useRef(0);
   const batchFinished = useRef(false);
   const batchCancelled = useRef(false);
+  const workerReady = useRef(false);
 
   useEffect(() => {
     void getApplicationVersion().then(setAppVersion);
@@ -214,12 +253,27 @@ export default function App() {
   }, [themeSettings]);
 
   useEffect(() => {
+    let disposed = false;
     let unsubscribe: (() => void) | undefined;
-    void onConversionEvent(handleConversionEvent).then((cleanup) => {
-      unsubscribe = cleanup;
-    });
+    void (async () => {
+      const unlisten = await onConversionEvent(handleConversionEvent);
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      unsubscribe = unlisten;
+      try {
+        const status = await ensureWorker();
+        if (disposed) return;
+        workerReady.current = status.ready;
+      } catch (error) {
+        if (disposed) return;
+        appendLog(`转换引擎启动失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
     return () => {
-      if (unsubscribe) unsubscribe();
+      disposed = true;
+      unsubscribe?.();
     };
   }, []);
 
@@ -230,20 +284,33 @@ export default function App() {
       setInspectionMessage("");
       return;
     }
-    const jobId = `inspect-${Date.now()}`;
+    inspectionSequence.current += 1;
+    const jobId = `inspect-${Date.now()}-${inspectionSequence.current}`;
     inspectionJob.current = jobId;
     setInspection(null);
     setInspectionStatus("running");
-    setInspectionMessage("正在读取文件头…");
+    setInspectionTotal(0);
+    setInspectionDone(0);
+    setCandidateFormatCounts({});
+    setPartialInspectionFiles([]);
+    setInspectionMessage(workerReady.current ? "正在扫描输入目录…" : "正在初始化转换引擎…");
+    setProgress((state) => state.running ? state : { ...state, status: "inspecting" });
     const timer = window.setTimeout(() => {
       void startInspection({ job_id: jobId, input_dir: inputDir, recursive }).catch((error) => {
         if (inspectionJob.current !== jobId) return;
+        const message = error instanceof Error ? error.message : String(error);
         setInspectionStatus("error");
-        setInspectionMessage(error instanceof Error ? error.message : String(error));
+        setInspectionMessage(message);
+        setProgress((state) => state.running ? state : {
+          ...state,
+          status: "error",
+          currentPhase: "预检失败",
+          finishedAt: Date.now(),
+        });
       });
     }, 150);
     return () => window.clearTimeout(timer);
-  }, [inputDir, recursive]);
+  }, [inputDir, recursive, inspectionRevision]);
 
   function appendLog(message: string) {
     setLogs((items) => [...items.slice(-299), message]);
@@ -293,6 +360,23 @@ export default function App() {
       if (event.job_id === inspectionJob.current) setInspectionStatus("running");
       return;
     }
+    if (event.type === "inspection_discovered") {
+      if (event.job_id !== inspectionJob.current) return;
+      setInspectionTotal(event.total);
+      setCandidateFormatCounts(event.format_counts);
+      setInspectionMessage(`发现 ${event.total} 张候选 WSI · 正在读取通道 0/${event.total}`);
+      return;
+    }
+    if (event.type === "inspection_file_done") {
+      if (event.job_id !== inspectionJob.current) return;
+      setInspectionDone(event.done);
+      setPartialInspectionFiles((files) => [
+        ...files.filter((file) => file.input_path !== event.file.input_path),
+        event.file,
+      ]);
+      setInspectionMessage(`发现 ${event.total} 张候选 WSI · 已读取通道 ${event.done}/${event.total}`);
+      return;
+    }
     if (event.type === "inspection_progress") {
       if (event.job_id !== inspectionJob.current) return;
       setInspectionMessage(
@@ -306,21 +390,28 @@ export default function App() {
       if (event.job_id !== inspectionJob.current) return;
       setInspection(event.inspection);
       setInspectionStatus("ready");
-      setInspectionMessage(`已预检 ${event.inspection.files.length} 个文件`);
+      setInspectionTotal(event.inspection.files.length);
+      setInspectionDone(event.inspection.files.length);
+      setPartialInspectionFiles(event.inspection.files);
+      setInspectionMessage(`检测到 ${event.inspection.files.length} 张 WSI`);
+      setProgress((state) => state.running ? state : { ...state, status: "ready" });
+      if (event.duration_ms !== undefined) appendLog(`inspection_ms=${event.duration_ms.toFixed(1)}`);
       return;
     }
     if (event.type === "inspection_error") {
       if (event.job_id && event.job_id !== inspectionJob.current) return;
       setInspectionStatus("error");
       setInspectionMessage(event.message);
+      setProgress((state) => state.running ? state : { ...state, status: "error" });
       return;
     }
     if (event.type === "ready") {
+      workerReady.current = true;
       appendLog(event.banner || "Python worker ready");
       return;
     }
     if (event.type === "started") {
-      setProgress((state) => ({ ...state, running: true, statusText: "Running" }));
+      setProgress((state) => ({ ...state, running: true, status: "running" }));
       return;
     }
     if (event.type === "report_path") {
@@ -375,7 +466,7 @@ export default function App() {
         return {
           ...state,
           running: true,
-          statusText: "Running",
+          status: "running",
           currentFile: basename(event.current),
           currentPhase: summarizeBatchPhase(nextPhaseStates),
           stagePercent: formatPercent(event.done, event.total),
@@ -420,7 +511,7 @@ export default function App() {
       setProgress((state) => ({
         ...state,
         running: false,
-        statusText: batch.cancelled ? "Cancelled" : failed ? "Error" : "Ready",
+        status: batch.cancelled ? "cancelled" : failed ? "error" : "success",
         currentPhase: batch.cancelled ? "已取消" : failed ? "转换失败" : summarizeBatchPhase(nextPhaseStates),
         batchDone: completedCount.current,
         batchTotal: batch.total_files,
@@ -428,13 +519,24 @@ export default function App() {
         etaText: batch.cancelled || failed ? "—" : "已完成",
         reportPath: batch.report_path || state.reportPath,
         backend: batch.results.length ? batch.results[batch.results.length - 1].backend : state.backend,
+        finishedAt: Date.now(),
+        successCount: batch.success_count,
+        failedCount: batch.failed_count,
+        skippedCount: batch.skipped_count,
       }));
       return;
     }
     if (event.type === "error") {
       batchFinished.current = true;
       batchCancelled.current = false;
-      setProgress((state) => ({ ...state, running: false, statusText: "Error", currentPhase: "完成", etaText: "—" }));
+      setProgress((state) => ({
+        ...state,
+        running: false,
+        status: "error",
+        currentPhase: "转换失败",
+        etaText: "—",
+        finishedAt: Date.now(),
+      }));
       appendLog(event.traceback || event.message);
       if (event.diagnostic_code) {
         appendLog(`${event.diagnostic_code} · ${event.diagnostic_stage || "unknown"}`);
@@ -442,16 +544,35 @@ export default function App() {
       return;
     }
     if (event.type === "worker_terminated") {
+      workerReady.current = false;
+      const message = `转换引擎异常退出: ${event.code ?? "-"} ${event.signal ?? ""}`.trim();
+      if (event.activity === "inspecting") {
+        appendLog(message);
+        if (event.job_id && event.job_id !== inspectionJob.current) return;
+        setInspectionStatus("error");
+        setInspectionMessage("转换引擎异常退出，请重新预检");
+        setProgress((state) => ({
+          ...state,
+          running: false,
+          status: "error",
+          currentPhase: "预检失败",
+          etaText: "—",
+          finishedAt: Date.now(),
+        }));
+        return;
+      }
+      if (!event.busy) return;
       batchFinished.current = true;
       batchCancelled.current = false;
       setProgress((state) => ({
         ...state,
         running: false,
-        statusText: "Error",
+        status: "error",
         currentPhase: "异常中止",
         etaText: "—",
+        finishedAt: Date.now(),
       }));
-      appendLog(`Worker terminated: ${event.code ?? "-"} ${event.signal ?? ""}`);
+      appendLog(message);
       return;
     }
   }
@@ -459,8 +580,19 @@ export default function App() {
   async function pickInput() {
     const path = await chooseDirectory();
     if (!path) return;
+    resetBatchAggregation();
+    setLogs([]);
+    setTaskSettings(null);
+    setDialog(null);
+    setPendingOverrides({});
+    setProgress({
+      ...initialProgress,
+      status: "inspecting",
+      currentFile: basename(path),
+      outputDir,
+    });
     setInputDir(path);
-    setProgress((state) => ({ ...state, currentFile: basename(path), statusText: "Idle" }));
+    if (path === inputDir) setInspectionRevision((revision) => revision + 1);
   }
 
   async function pickOutput() {
@@ -497,7 +629,7 @@ export default function App() {
     setProgress({
       ...initialProgress,
       running: true,
-      statusText: "Starting",
+      status: "starting",
       currentFile: basename(inputDir),
       outputDir,
       startedAt: Date.now(),
@@ -529,10 +661,16 @@ export default function App() {
             { size: file.file_size, mtime_ns: file.file_mtime_ns },
           ]),
         ),
+        preflight_files: inspection.files,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setProgress((state) => ({ ...state, running: false, statusText: "Error" }));
+      setProgress((state) => ({
+        ...state,
+        running: false,
+        status: "error",
+        finishedAt: Date.now(),
+      }));
       appendLog(message);
     }
   }
@@ -579,9 +717,11 @@ export default function App() {
     setPendingOverrides({});
     setProgress({
       ...initialProgress,
+      status: inputDir ? "inspecting" : "idle",
       currentFile: inputDir ? basename(inputDir) : initialProgress.currentFile,
       outputDir,
     });
+    if (inputDir) setInspectionRevision((revision) => revision + 1);
   }
 
   function updateTheme(next: ThemeSettings) {
@@ -644,7 +784,7 @@ export default function App() {
             <h1>{inputDir ? basename(inputDir) : "未选择任务"}</h1>
             <p>{inputDir ? "确认输出目录和格式后即可开始转换。" : "选择一个输入目录后开始转换。"}</p>
           </div>
-          <div className={`status-chip ${progress.statusText.toLowerCase()}`}>{progress.statusText}</div>
+          <div className={`status-chip ${progress.status}`}>{taskStatusLabels[progress.status]}</div>
         </header>
 
         {view === "settings" ? (
@@ -657,6 +797,12 @@ export default function App() {
         ) : (
           <div className="work-grid">
             <section className="task-flow">
+              <TaskStatusBanner
+                progress={progress}
+                inspectionMessage={inspectionMessage}
+                onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
+                onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
+              />
               <div className="phase-list">
                 {phaseStates.map((phaseState) => (
                   <div
@@ -697,10 +843,15 @@ export default function App() {
             recursive={recursive}
             canStart={canStart}
             running={progress.running}
+            taskStatus={progress.status}
             reportPath={progress.reportPath}
             inspection={inspection}
             inspectionStatus={inspectionStatus}
             inspectionMessage={inspectionMessage}
+            inspectionTotal={inspectionTotal}
+            inspectionDone={inspectionDone}
+            candidateFormatCounts={candidateFormatCounts}
+            partialInspectionFiles={partialInspectionFiles}
             formatCounts={formatCounts}
             onInput={pickInput}
             onOutput={pickOutput}
@@ -744,6 +895,66 @@ function NavItem({ active, icon, label, onClick }: { active: boolean; icon: Reac
       {icon}
       <span>{label}</span>
     </button>
+  );
+}
+
+export function TaskStatusBanner({
+  progress,
+  inspectionMessage,
+  onOpenOutput,
+  onOpenReport,
+}: {
+  progress: ProgressState;
+  inspectionMessage: string;
+  onOpenOutput: () => void;
+  onOpenReport: () => void;
+}) {
+  if (progress.status === "idle") return null;
+
+  const isBusy = progress.status === "inspecting" || progress.status === "starting" || progress.status === "running";
+  const isPreflightError = progress.status === "error" && progress.startedAt === null;
+  const icon = isBusy
+    ? <LoaderCircle className="status-banner-spinner" size={20} />
+    : progress.status === "ready" || progress.status === "success"
+      ? <CheckCircle2 size={20} />
+      : <CircleAlert size={20} />;
+  const title = progress.status === "inspecting"
+    ? "正在预检输入文件"
+    : progress.status === "ready"
+      ? "预检完成，可以开始转换"
+      : progress.status === "starting"
+        ? "正在启动转换"
+        : progress.status === "running"
+          ? `正在转换 ${progress.currentFile}`
+          : progress.status === "success"
+            ? "转换完成"
+            : progress.status === "cancelled"
+              ? "转换已取消"
+              : isPreflightError ? "预检失败" : "转换失败";
+  const detail = progress.status === "inspecting" || progress.status === "ready"
+    ? inspectionMessage
+    : progress.status === "starting"
+      ? "正在复用转换引擎并准备任务…"
+      : progress.status === "running"
+        ? `${progress.currentPhase} · ${Math.round(progress.batchPercent)}% · ETA ${progress.etaText}`
+        : progress.status === "success"
+          ? `成功 ${progress.successCount} · 失败 ${progress.failedCount} · 跳过 ${progress.skippedCount} · 用时 ${formatDuration(progress.startedAt, progress.finishedAt)}`
+          : isPreflightError ? inspectionMessage : progress.currentPhase;
+
+  return (
+    <section className={`task-status-banner ${progress.status}`} aria-live="polite">
+      <span className="task-status-icon">{icon}</span>
+      <div>
+        <strong>{title}</strong>
+        <p>{detail}</p>
+      </div>
+      {(progress.status === "success" || progress.status === "error" || progress.status === "cancelled") && (
+        <div className="task-status-actions">
+          <button className="ghost" disabled={!progress.outputDir} onClick={onOpenOutput}>打开输出</button>
+          <button className="ghost" disabled={!progress.reportPath} onClick={onOpenReport}>查看报告</button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -805,7 +1016,7 @@ function PerformanceSummary({
         </div>
         <div>
           <dt>ETA</dt>
-          <dd>{progress.running ? progress.etaText : progress.statusText === "Ready" ? "已完成" : "—"}</dd>
+          <dd>{progress.running ? progress.etaText : progress.status === "success" ? "已完成" : "—"}</dd>
         </div>
       </dl>
       <PerformanceBar
@@ -839,7 +1050,7 @@ function PerformanceBar({ label, value, percent }: { label: string; value: strin
   );
 }
 
-function TaskComposer({
+export function TaskComposer({
   inputDir,
   outputDir,
   outputFormat,
@@ -847,10 +1058,15 @@ function TaskComposer({
   recursive,
   canStart,
   running,
+  taskStatus,
   reportPath,
   inspection,
   inspectionStatus,
   inspectionMessage,
+  inspectionTotal,
+  inspectionDone,
+  candidateFormatCounts,
+  partialInspectionFiles,
   formatCounts,
   onInput,
   onOutput,
@@ -870,10 +1086,15 @@ function TaskComposer({
   recursive: boolean;
   canStart: boolean;
   running: boolean;
+  taskStatus: TaskStatus;
   reportPath: string;
   inspection: BatchInspection | null;
   inspectionStatus: "idle" | "running" | "ready" | "error";
   inspectionMessage: string;
+  inspectionTotal: number;
+  inspectionDone: number;
+  candidateFormatCounts: Record<string, number>;
+  partialInspectionFiles: InputInspection[];
   formatCounts: Record<OutputFormat, number>;
   onInput: () => void;
   onOutput: () => void;
@@ -895,7 +1116,7 @@ function TaskComposer({
       <div className="format-note" aria-label="支持的输入格式">
         <span className="format-note-label">输入格式</span>
         <span className="format-note-values">
-          .ibl · .kfb/.kfbl/.kfbf/.kfba/.kfbx · <strong>.image</strong> · .svs · .tif/.tiff · .afi
+          .ibl · .kfb/.kfbl/.kfbf/.kfba/.kfbx · .image · .svs · .tif/.tiff · .afi
         </span>
         <span className="format-note-auto">自动识别</span>
       </div>
@@ -903,6 +1124,10 @@ function TaskComposer({
         inspection={inspection}
         status={inspectionStatus}
         message={inspectionMessage}
+        total={inspectionTotal}
+        done={inspectionDone}
+        candidateFormatCounts={candidateFormatCounts}
+        partialFiles={partialInspectionFiles}
       />
       <div className="action-row">
         <div className="segment format-segment">
@@ -915,7 +1140,7 @@ function TaskComposer({
             <button
               key={format}
               className={outputFormat === format ? "selected" : ""}
-              disabled={inspectionStatus === "ready" && formatCounts[format] === 0}
+              disabled={running || (inspectionStatus === "ready" && formatCounts[format] === 0)}
               onClick={() => onFormat(format)}
             >
               {label}
@@ -928,8 +1153,10 @@ function TaskComposer({
           包含子文件夹
         </label>
         <button className="primary" disabled={!canStart} onClick={onStart}>
-          <Play size={16} />
-          开始转换
+          {taskStatus === "starting" || taskStatus === "running"
+            ? <LoaderCircle className="button-spinner" size={16} />
+            : <Play size={16} />}
+          {taskStatus === "starting" ? "正在启动" : taskStatus === "running" ? "转换中" : "开始转换"}
         </button>
         <button className="soft" disabled={!running} onClick={onCancel}>
           <Square size={14} />
@@ -956,42 +1183,84 @@ function TaskComposer({
   );
 }
 
-function InspectionSummary({
+export function InspectionSummary({
   inspection,
   status,
   message,
+  total,
+  done,
+  candidateFormatCounts,
+  partialFiles,
 }: {
   inspection: BatchInspection | null;
   status: "idle" | "running" | "ready" | "error";
   message: string;
+  total: number;
+  done: number;
+  candidateFormatCounts: Record<string, number>;
+  partialFiles: InputInspection[];
 }) {
-  if (status !== "ready" || !inspection) {
-    return <div className={`inspection-summary ${status}`}>{message || "选择输入目录后自动预检"}</div>;
-  }
-  const brightfield = inspection.files.filter((file) => file.source_modality === "brightfield").length;
-  const fluorescence = inspection.files.filter((file) => file.source_modality === "fluorescence").length;
-  const unknownChannels = inspection.files.reduce(
+  const files = status === "ready" && inspection ? inspection.files : partialFiles;
+  const formatCounts = files.length > 0
+    ? files.reduce<Record<string, number>>((counts, file) => {
+        const label = inspectionFormatLabel(file);
+        counts[label] = (counts[label] || 0) + 1;
+        return counts;
+      }, {})
+    : Object.fromEntries(
+        Object.entries(candidateFormatCounts).map(([extension, count]) => [extension.toUpperCase(), count]),
+      );
+  const brightfield = files.filter((file) => file.source_modality === "brightfield").length;
+  const fluorescence = files.filter((file) => file.source_modality === "fluorescence").length;
+  const failed = files.filter((file) => Boolean(file.error)).length;
+  const unknownChannels = files.reduce(
     (count, file) => count + (file.source_modality === "fluorescence"
       ? file.channel_definitions.filter((channel) => channel.identity_source === "unknown").length
       : 0),
     0,
   );
-  const recognizedChannels = inspection.files.reduce(
+  const recognizedChannels = files.reduce(
     (count, file) => count + (file.source_modality === "fluorescence"
       ? file.channel_definitions.filter((channel) => channel.identity_source !== "unknown").length
       : 0),
     0,
   );
+  if (status === "idle") {
+    return <div className="inspection-summary idle">{message || "选择输入目录后自动预检"}</div>;
+  }
   return (
-    <div className="inspection-summary ready">
-      <span>预检完成</span>
-      <strong>{inspection.files.length} 个文件</strong>
-      <span>明场 {brightfield}</span>
-      <span>荧光 {fluorescence}</span>
-      <span>已识别通道 {recognizedChannels}</span>
-      <span className={unknownChannels ? "warning" : ""}>未知通道 {unknownChannels}</span>
+    <div className={`inspection-summary ${status}`} aria-live="polite">
+      <span>{status === "ready" ? "检测完成" : status === "error" ? "检测失败" : "正在检测"}</span>
+      <strong>{status === "ready" ? `${files.length} 张 WSI` : `${done}/${total || 0}`}</strong>
+      <div className="inspection-formats">
+        {Object.entries(formatCounts)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([label, count]) => <span className="format-badge" key={label}>{label} {count}</span>)}
+      </div>
+      {files.length > 0 && <span>明场 {brightfield} · 荧光 {fluorescence}</span>}
+      {recognizedChannels > 0 && <span>已识别通道 {recognizedChannels}</span>}
+      {unknownChannels > 0 && <span className="warning">未知通道 {unknownChannels}</span>}
+      {failed > 0 && <span className="warning">无法识别 {failed}</span>}
+      {message && status === "error" && <span className="warning">{message}</span>}
     </div>
   );
+}
+
+function inspectionFormatLabel(file: InputInspection): string {
+  const container = (file.source_container || "").toLowerCase();
+  const labels: Record<string, string> = {
+    ome_tiff: "OME-TIFF",
+    fluorescence_svs: "荧光 SVS",
+    generic_tiff: "TIFF",
+    svs: "SVS",
+    kfb: "KFB",
+    kfbl: "KFBL",
+    kfbf: "KFBF",
+    kfba: "KFBA",
+    kfbx: "KFBX",
+    afi: "AFI",
+  };
+  return labels[container] || labels[file.input_format] || file.input_format.toUpperCase();
 }
 
 const channelPresets: Record<string, { color: [number, number, number]; excitation_nm: number | null; emission_nm: number | null }> = {
@@ -1002,6 +1271,8 @@ const channelPresets: Record<string, { color: [number, number, number]; excitati
   Cy5: { color: [255, 0, 80], excitation_nm: 650, emission_nm: 670 },
   AF: { color: [255, 255, 255], excitation_nm: null, emission_nm: null },
 };
+
+type ChannelDraft = ChannelDefinition & { preset: string };
 
 function colorHex(color: [number, number, number]): string {
   return `#${color.map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
@@ -1017,7 +1288,7 @@ function parentPath(path: string): string {
   return normalized.slice(0, normalized.lastIndexOf("/"));
 }
 
-function ChannelDialog({
+export function ChannelDialog({
   files,
   onCancel,
   onContinue,
@@ -1028,13 +1299,18 @@ function ChannelDialog({
 }) {
   const [search, setSearch] = useState("");
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
-  const [drafts, setDrafts] = useState<Record<string, ChannelDefinition[]>>(() =>
+  const nameInputs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [drafts, setDrafts] = useState<Record<string, ChannelDraft[]>>(() =>
     Object.fromEntries(
       files
         .filter((file) => file.source_modality === "fluorescence" && file.channel_definitions.length > 0)
         .map((file) => [
           file.input_path,
-          file.channel_definitions.map((channel) => ({ ...channel, color: [...channel.color] as [number, number, number] })),
+          file.channel_definitions.map((channel) => ({
+            ...channel,
+            color: [...channel.color] as [number, number, number],
+            preset: channelPresets[channel.name] ? channel.name : "custom",
+          })),
         ]),
     ),
   );
@@ -1051,7 +1327,7 @@ function ChannelDialog({
     }, {}),
   );
 
-  function update(path: string, index: number, patch: Partial<ChannelDefinition>) {
+  function update(path: string, index: number, patch: Partial<ChannelDraft>) {
     setDrafts((current) => ({
       ...current,
       [path]: current[path].map((channel) => channel.index === index
@@ -1061,9 +1337,19 @@ function ChannelDialog({
   }
 
   function applyPreset(path: string, index: number, presetName: string) {
+    if (presetName === "custom") {
+      update(path, index, { preset: "custom" });
+      window.setTimeout(() => {
+        const input = nameInputs.current[`${path}:${index}`];
+        input?.focus();
+        input?.select();
+      }, 50);
+      return;
+    }
     const preset = channelPresets[presetName];
     if (!preset) return;
     update(path, index, {
+      preset: presetName,
       name: presetName,
       fluor: presetName,
       color: preset.color,
@@ -1072,7 +1358,7 @@ function ChannelDialog({
     });
   }
 
-  function applyToFolder(path: string, definition: ChannelDefinition) {
+  function applyToFolder(path: string, definition: ChannelDraft) {
     const folder = parentPath(path);
     setDrafts((current) => Object.fromEntries(
       Object.entries(current).map(([filePath, channels]) => [
@@ -1086,7 +1372,7 @@ function ChannelDialog({
     ));
   }
 
-  function applyToSelected(definition: ChannelDefinition) {
+  function applyToSelected(definition: ChannelDraft) {
     setDrafts((current) => Object.fromEntries(
       Object.entries(current).map(([filePath, channels]) => [
         filePath,
@@ -1106,6 +1392,15 @@ function ChannelDialog({
       else next.add(path);
       return next;
     });
+  }
+
+  function serializedDrafts(): Record<string, ChannelDefinition[]> {
+    return Object.fromEntries(
+      Object.entries(drafts).map(([path, channels]) => [
+        path,
+        channels.map(({ preset: _preset, ...channel }) => channel),
+      ]),
+    );
   }
 
   return (
@@ -1146,14 +1441,37 @@ function ChannelDialog({
                       <span className={`channel-source ${channel.identity_source === "unknown" ? "unknown" : ""}`}>
                         C{channel.index + 1} · {channel.identity_source}
                       </span>
-                      <select value={channelPresets[channel.name] ? channel.name : "custom"} onChange={(event) => applyPreset(file.input_path, channel.index, event.target.value)}>
-                        <option value="custom">自定义</option>
-                        {Object.keys(channelPresets).map((name) => <option key={name} value={name}>{name}</option>)}
-                      </select>
-                      <input value={channel.name} aria-label="通道名称" onChange={(event) => update(file.input_path, channel.index, { name: event.target.value, fluor: event.target.value })} />
-                      <input type="color" value={colorHex(channel.color)} aria-label="显示色" onChange={(event) => update(file.input_path, channel.index, { color: parseColor(event.target.value) })} />
-                      <input type="number" placeholder="激发 nm" value={channel.excitation_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { excitation_nm: event.target.value ? Number(event.target.value) : null })} />
-                      <input type="number" placeholder="发射 nm" value={channel.emission_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { emission_nm: event.target.value ? Number(event.target.value) : null })} />
+                      <Select.Root value={channel.preset} onValueChange={(value) => applyPreset(file.input_path, channel.index, value)}>
+                        <Select.Trigger className="channel-select-trigger" aria-label={`C${channel.index + 1} 荧光预设`}>
+                          <Select.Value />
+                          <Select.Icon><ChevronDown size={14} /></Select.Icon>
+                        </Select.Trigger>
+                        <Select.Portal>
+                          <Select.Content className="channel-select-content" position="popper" sideOffset={6}>
+                            <Select.Viewport>
+                              {["custom", ...Object.keys(channelPresets)].map((name) => (
+                                <Select.Item className="channel-select-item" key={name} value={name}>
+                                  <Select.ItemText>{name === "custom" ? "自定义" : name}</Select.ItemText>
+                                  <Select.ItemIndicator><Check size={14} /></Select.ItemIndicator>
+                                </Select.Item>
+                              ))}
+                            </Select.Viewport>
+                          </Select.Content>
+                        </Select.Portal>
+                      </Select.Root>
+                      <input
+                        ref={(element) => { nameInputs.current[`${file.input_path}:${channel.index}`] = element; }}
+                        value={channel.name}
+                        aria-label="通道名称"
+                        onChange={(event) => update(file.input_path, channel.index, {
+                          name: event.target.value,
+                          fluor: event.target.value,
+                          preset: "custom",
+                        })}
+                      />
+                      <input type="color" value={colorHex(channel.color)} aria-label="显示色" onChange={(event) => update(file.input_path, channel.index, { color: parseColor(event.target.value), preset: "custom" })} />
+                      <input type="number" placeholder="激发 nm" value={channel.excitation_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { excitation_nm: event.target.value ? Number(event.target.value) : null, preset: "custom" })} />
+                      <input type="number" placeholder="发射 nm" value={channel.emission_nm ?? ""} onChange={(event) => update(file.input_path, channel.index, { emission_nm: event.target.value ? Number(event.target.value) : null, preset: "custom" })} />
                       <button className="ghost" disabled={selectedPaths.size === 0} onClick={() => applyToSelected(channel)}>应用到选中文件</button>
                       <button className="ghost" onClick={() => applyToFolder(file.input_path, channel)}>应用到当前文件夹</button>
                     </div>
@@ -1166,7 +1484,7 @@ function ChannelDialog({
         </div>
         <footer>
           <button className="soft" onClick={() => onContinue({})}>按序号编码并继续</button>
-          <button className="primary" onClick={() => onContinue(drafts)}>使用当前定义并继续</button>
+          <button className="primary" onClick={() => onContinue(serializedDrafts())}>使用当前定义并继续</button>
         </footer>
       </section>
     </div>
@@ -1248,21 +1566,21 @@ function SettingsView({
       <div className="settings-group">
         <label>转换参数</label>
         <div className="settings-grid">
-          <NumberField
+          <StepperField
             label="同时处理 WSI"
             value={conversionSettings.parallel_wsi}
             min={1}
             max={8}
             onChange={(value) => onConversionChange({ ...conversionSettings, parallel_wsi: value })}
           />
-          <NumberField
+          <StepperField
             label="JPEG quality"
             value={conversionSettings.jpeg_quality}
             min={1}
             max={100}
             onChange={(value) => onConversionChange({ ...conversionSettings, jpeg_quality: value })}
           />
-          <NumberField
+          <StepperField
             label="内存预算 MB"
             value={conversionSettings.memory_budget_mb}
             min={1024}
@@ -1285,7 +1603,7 @@ function SettingsView({
   );
 }
 
-function NumberField({
+export function StepperField({
   label,
   value,
   min,
@@ -1300,6 +1618,7 @@ function NumberField({
   step?: number;
   onChange: (value: number) => void;
 }) {
+  const inputId = useId();
   const [draft, setDraft] = useState(String(value));
 
   useEffect(() => {
@@ -1323,21 +1642,45 @@ function NumberField({
     onChange(committed);
   }
 
+  function nudge(direction: -1 | 1) {
+    const parsed = parseDraft(draft) ?? value;
+    commitDraft(String(parsed + direction * step));
+  }
+
   return (
-    <label className="text-field">
-      <span>{label}</span>
-      <input
-        type="number"
-        min={min}
-        max={max}
-        step={step}
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={(event) => commitDraft(event.currentTarget.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") event.currentTarget.blur();
-        }}
-      />
-    </label>
+    <div className="text-field">
+      <label htmlFor={inputId}>{label}</label>
+      <span className="stepper-field">
+        <input
+          id={inputId}
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={(event) => commitDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur();
+            if (event.key === "ArrowUp") {
+              event.preventDefault();
+              nudge(1);
+            }
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              nudge(-1);
+            }
+          }}
+        />
+        <span className="stepper-actions">
+          <button type="button" aria-label={`减小${label}`} disabled={Number(draft) <= min} onClick={() => nudge(-1)}>
+            <Minus size={14} />
+          </button>
+          <button type="button" aria-label={`增大${label}`} disabled={Number(draft) >= max} onClick={() => nudge(1)}>
+            <Plus size={14} />
+          </button>
+        </span>
+      </span>
+    </div>
   );
 }

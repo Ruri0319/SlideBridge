@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import type { ConversionEvent, ConversionRequest, InspectionRequest } from "./types";
+import type { ConversionEvent, ConversionRequest, InspectionRequest, WorkerStatus } from "./types";
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -30,6 +30,20 @@ export async function startConversion(request: ConversionRequest): Promise<void>
     throw new Error("Tauri runtime is not available. Use npm run tauri dev for conversions.");
   }
   await invoke("start_conversion", { request });
+}
+
+export async function ensureWorker(): Promise<WorkerStatus> {
+  if (!isTauri()) {
+    return { alive: false, ready: false, activity: "unavailable", job_id: null };
+  }
+  return invoke<WorkerStatus>("ensure_worker");
+}
+
+export async function getWorkerStatus(): Promise<WorkerStatus> {
+  if (!isTauri()) {
+    return { alive: false, ready: false, activity: "unavailable", job_id: null };
+  }
+  return invoke<WorkerStatus>("worker_status");
 }
 
 export async function startInspection(request: InspectionRequest): Promise<void> {

@@ -571,10 +571,13 @@ def convert_folder(
     progress_callback=None,
     cancel_event=None,
 ) -> BatchResult:
+    prepare_started = time.perf_counter()
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     if options.selected_input_paths is None:
         files = find_convertible_files(input_dir, recursive=options.recursive, output_format=options.output_format)
+    elif options.preflight_files is not None:
+        files = [Path(path) for path in options.selected_input_paths]
     else:
         selected = {Path(path).resolve() for path in options.selected_input_paths}
         files = [
@@ -583,17 +586,41 @@ def convert_folder(
             if path.resolve() in selected
         ]
 
-    inspections = [(path, inspect_file(path)) for path in files]
+    preflight_by_path = {
+        str(item.input_path.resolve()): item
+        for item in (options.preflight_files or ())
+    }
+    inspections = [
+        (path, preflight_by_path.get(str(path.resolve())) or inspect_file(path))
+        for path in files
+    ]
     compatible_files: list[Path] = []
     incompatible: list[tuple[int, Path, object, str]] = []
     for index, (path, inspection) in enumerate(inspections, start=1):
         expected_signature = options.input_signatures.get(str(path))
         if expected_signature is None:
             expected_signature = options.input_signatures.get(str(path.resolve()))
-        signature_changed = expected_signature is not None and (
-            int(expected_signature.get("size", -1)) != inspection.file_size
-            or int(expected_signature.get("mtime_ns", -1)) != inspection.file_mtime_ns
-        )
+        has_snapshot = str(path.resolve()) in preflight_by_path
+        signature_changed = False
+        if expected_signature is not None or has_snapshot:
+            try:
+                stat = path.stat()
+                actual_size = stat.st_size
+                actual_mtime_ns = stat.st_mtime_ns
+            except OSError:
+                actual_size = -1
+                actual_mtime_ns = -1
+            expected_size = (
+                int(expected_signature.get("size", -1))
+                if expected_signature is not None
+                else inspection.file_size
+            )
+            expected_mtime_ns = (
+                int(expected_signature.get("mtime_ns", -1))
+                if expected_signature is not None
+                else inspection.file_mtime_ns
+            )
+            signature_changed = actual_size != expected_size or actual_mtime_ns != expected_mtime_ns
         if signature_changed:
             incompatible.append((index, path, inspection, "文件在预检后发生变化，请重新预检"))
         elif inspection.error:
@@ -630,33 +657,39 @@ def convert_folder(
         )
     ]
     result_entries: list[tuple[int, ConvertResult]] = []
+
+    def unstarted_result(path: Path, inspection, status: str, reason: str) -> ConvertResult:
+        return ConvertResult(
+            input_path=path,
+            output_path=None,
+            success=False,
+            input_format=inspection.input_format,
+            status=status,
+            output_format=options.output_format,
+            source_modality=inspection.source_modality,
+            source_container=inspection.source_container,
+            source_version=inspection.source_version,
+            source_codec=inspection.source_codec,
+            source_bit_depth=inspection.source_bit_depth,
+            source_channel_count=inspection.channel_count,
+            channel_definitions=[asdict(item) for item in inspection.channel_definitions],
+            channel_identity_source=[item.identity_source for item in inspection.channel_definitions],
+            skipped_reason=reason,
+        )
+
     for index, path, inspection, reason in incompatible:
         result_entries.append(
             (
                 index,
-                ConvertResult(
-                    input_path=path,
-                    output_path=None,
-                    success=False,
-                    input_format=inspection.input_format,
-                    status="skipped_incompatible",
-                    output_format=options.output_format,
-                    source_modality=inspection.source_modality,
-                    source_container=inspection.source_container,
-                    source_version=inspection.source_version,
-                    source_codec=inspection.source_codec,
-                    source_bit_depth=inspection.source_bit_depth,
-                    source_channel_count=inspection.channel_count,
-                    channel_definitions=[asdict(item) for item in inspection.channel_definitions],
-                    channel_identity_source=[item.identity_source for item in inspection.channel_definitions],
-                    skipped_reason=reason,
-                ),
+                unstarted_result(path, inspection, "skipped_incompatible", reason),
             )
         )
     cancelled = False
+    stopped_after_failure = False
     parallel_wsi = options.resolved_parallel_wsi()
 
     if logger:
+        logger(f"conversion_prepare_ms={(time.perf_counter() - prepare_started) * 1000:.1f}")
         logger(runtime_banner())
         logger(f"发现 {len(files)} 个输入文件，其中 {len(compatible_files)} 个兼容当前输出格式")
         logger(f"WSI 并行任务数: {parallel_wsi}")
@@ -690,6 +723,7 @@ def convert_folder(
             if overall_callback:
                 overall_callback(completed, len(files), str(input_path))
             if not result.success and not options.continue_on_error:
+                stopped_after_failure = True
                 break
     else:
         pending_index = 0
@@ -748,6 +782,7 @@ def convert_folder(
                         overall_callback(completed, len(files), str(input_path))
                     if not result.success and not options.continue_on_error:
                         stop_submitting = True
+                        stopped_after_failure = True
 
                 while (
                     not stop_submitting
@@ -760,12 +795,28 @@ def convert_folder(
         if cancelled and logger:
             logger("批处理取消等待已运行任务结束")
 
+    completed_indexes = {index for index, _result in result_entries}
+    inspection_by_path = {path: inspection for path, inspection in inspections}
+    for index, input_path, _output_path in output_plan:
+        if index in completed_indexes:
+            continue
+        inspection = inspection_by_path[input_path]
+        if cancelled or (cancel_event is not None and cancel_event.is_set()):
+            status = "cancelled"
+            reason = "批处理已取消，未开始转换"
+        elif stopped_after_failure:
+            status = "not_started"
+            reason = "前序文件失败且已启用遇错停止"
+        else:
+            continue
+        result_entries.append((index, unstarted_result(input_path, inspection, status, reason)))
+
     results = [result for _, result in sorted(result_entries, key=lambda item: item[0])]
     batch = BatchResult(
         total_files=len(files),
         success_count=sum(1 for result in results if result.success),
         failed_count=sum(1 for result in results if result.status == "failed"),
-        skipped_count=sum(1 for result in results if result.status == "skipped_incompatible"),
+        skipped_count=sum(1 for result in results if result.status in {"skipped_incompatible", "not_started"}),
         cancelled_count=sum(1 for result in results if result.status == "cancelled"),
         cancelled=cancelled or any(result.status == "cancelled" for result in results),
         results=results,

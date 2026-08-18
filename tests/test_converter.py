@@ -18,13 +18,35 @@ from ibl2svs.converter import (
     find_ibl_files,
     write_report,
 )
-from ibl2svs.models import ConvertOptions, ConvertResult
+from ibl2svs.models import ConvertOptions, ConvertResult, InputInspection
 from ibl2svs.inspection import inspect_file
 from ibl2svs.writer import WriteImageError
 from tests.support import create_sample_ibl, create_sample_image, create_sample_kfb
 
 
 class ConverterTests(unittest.TestCase):
+    @staticmethod
+    def _compatible_inspection(path: Path) -> InputInspection:
+        stat = path.stat()
+        return InputInspection(
+            input_path=path,
+            file_size=stat.st_size,
+            file_mtime_ns=stat.st_mtime_ns,
+            input_format="ibl",
+            source_modality="brightfield",
+            source_container="ibl",
+            source_version=None,
+            source_codec="JPEG",
+            source_bit_depth=8,
+            field_count=1,
+            channel_count=0,
+            z_count=1,
+            t_count=1,
+            channel_definitions=(),
+            allowed_output_formats=("ome_tiff", "svs"),
+            incompatible_reasons={},
+        )
+
     def test_find_ibl_files_honors_recursion_and_case(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -380,6 +402,50 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(batch.skipped_count, 1)
             self.assertIn("预检后发生变化", batch.results[0].skipped_reason)
 
+    def test_preflight_snapshot_avoids_duplicate_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            sample = input_dir / "sample.kfbf"
+            create_sample_kfb(
+                sample,
+                variant="kfbf",
+                fluorescence_channel=("DAPI", (0, 0, 255), 85.0),
+            )
+            inspection = inspect_file(sample)
+
+            def fake_convert(input_path, output_path, options, logger=None, progress_callback=None, cancel_event=None):
+                return ConvertResult(
+                    input_path=Path(input_path),
+                    output_path=Path(output_path),
+                    success=True,
+                    output_format=options.output_format,
+                )
+
+            with mock.patch("ibl2svs.converter.inspect_file", side_effect=AssertionError("duplicate preflight")), mock.patch(
+                "ibl2svs.converter.convert_file", side_effect=fake_convert
+            ):
+                batch = convert_folder(
+                    input_dir,
+                    output_dir,
+                    ConvertOptions(
+                        output_format="ome_tiff",
+                        selected_input_paths=(str(sample),),
+                        input_signatures={
+                            str(sample): {
+                                "size": inspection.file_size,
+                                "mtime_ns": inspection.file_mtime_ns,
+                            }
+                        },
+                        preflight_files=(inspection,),
+                    ),
+                )
+
+            self.assertEqual(batch.success_count, 1)
+
     def test_overall_progress_counts_skipped_incompatible_files(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -415,6 +481,70 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(batch.skipped_count, 1)
             self.assertEqual(batch.success_count, 1)
             self.assertEqual(progress[-1][:2], (2, 2))
+
+    def test_cancelled_batch_reports_every_unstarted_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            files = [input_dir / name for name in ("a.ibl", "b.ibl", "c.ibl")]
+            for path in files:
+                path.write_text("x")
+            inspections = {path: self._compatible_inspection(path) for path in files}
+            cancel_event = threading.Event()
+            cancel_event.set()
+
+            with mock.patch("ibl2svs.converter.inspect_file", side_effect=lambda path: inspections[Path(path)]):
+                batch = convert_folder(
+                    input_dir,
+                    output_dir,
+                    ConvertOptions(output_format="ome_tiff"),
+                    cancel_event=cancel_event,
+                )
+
+            self.assertEqual(len(batch.results), 3)
+            self.assertEqual(batch.cancelled_count, 3)
+            self.assertTrue(batch.cancelled)
+            self.assertTrue(all(result.status == "cancelled" for result in batch.results))
+
+    def test_fail_fast_reports_files_that_were_not_started(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            files = [input_dir / name for name in ("a.ibl", "b.ibl", "c.ibl")]
+            for path in files:
+                path.write_text("x")
+            inspections = {path: self._compatible_inspection(path) for path in files}
+
+            def fail_first(input_path, output_path, options, **kwargs):
+                return ConvertResult(
+                    input_path=Path(input_path),
+                    output_path=None,
+                    success=False,
+                    status="failed",
+                    output_format=options.output_format,
+                    error="failed",
+                )
+
+            with (
+                mock.patch("ibl2svs.converter.inspect_file", side_effect=lambda path: inspections[Path(path)]),
+                mock.patch("ibl2svs.converter.convert_file", side_effect=fail_first),
+            ):
+                batch = convert_folder(
+                    input_dir,
+                    output_dir,
+                    ConvertOptions(output_format="ome_tiff", continue_on_error=False),
+                )
+
+            self.assertEqual(len(batch.results), 3)
+            self.assertEqual(batch.failed_count, 1)
+            self.assertEqual(batch.skipped_count, 2)
+            self.assertEqual([result.status for result in batch.results], ["failed", "not_started", "not_started"])
 
 
 if __name__ == "__main__":

@@ -234,7 +234,8 @@ class IBLSlide:
         if not counts:
             raise IBLValidationError("tbl_tile_info 中没有全分辨率 layer=0 数据")
 
-        bad = [row["id"] for row in counts if int(row["n"]) != 16]
+        counts_by_id = {int(row["id"]): int(row["n"]) for row in counts}
+        bad = [block.block_id for block in self.blocks if counts_by_id.get(block.block_id, 0) != 16]
         if bad:
             raise IBLValidationError(f"存在不完整的全分辨率块，示例 block_id={bad[0]}")
 

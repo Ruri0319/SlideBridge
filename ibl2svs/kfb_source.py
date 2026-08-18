@@ -484,6 +484,33 @@ class KfbSlideSource:
         packed_samples = int(self.source_channel_count)
         has_channel_directory = bool(self.channel_metadata)
         tile_channels = {tile.channel_index for tile in self._tiles}
+        if self.native_channel_count > 1 and tile_channels != set(range(self.native_channel_count)):
+            raise self._error(
+                "KFB 声明了多通道，但索引无法映射全部原生通道平面",
+                code="unsupported_layout",
+                stage="index",
+            )
+        tile_fields = {tile.field_index for tile in self._tiles}
+        if len(self.native_fields) > 1 and tile_fields != set(self.native_fields):
+            raise self._error(
+                "KFB 声明了多 Field，但索引无法映射全部原生 Field",
+                code="unsupported_layout",
+                stage="index",
+            )
+        tile_z = {tile.z_index for tile in self._tiles}
+        tile_t = {tile.t_index for tile in self._tiles}
+        if self.native_z_count > 1 and tile_z != set(range(self.native_z_count)):
+            raise self._error(
+                "KFB 声明了多 Z，但索引无法映射全部原生 Z 平面",
+                code="unsupported_layout",
+                stage="index",
+            )
+        if self.native_t_count > 1 and tile_t != set(range(self.native_t_count)):
+            raise self._error(
+                "KFB 声明了多 T，但索引无法映射全部原生 T 平面",
+                code="unsupported_layout",
+                stage="index",
+            )
         independent_planes = (
             self.native_channel_count >= 1
             and tile_channels == set(range(self.native_channel_count))

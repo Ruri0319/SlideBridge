@@ -130,6 +130,7 @@ class ConvertOptions:
     convert_compatible_only: bool = False
     channel_overrides: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     input_signatures: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    preflight_files: tuple[InputInspection, ...] | None = None
 
     def resolved_tile_size(self) -> int:
         if self.output_format == "svs" and self.tile_size == 256:

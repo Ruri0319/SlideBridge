@@ -64,10 +64,11 @@ def _field_metadata(slide, field_index: int) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "axes": "TZCYX",
         "Name": f"{slide.path.stem} field {field_index}",
-        "Description": "Modality=fluorescence",
         "SignificantBits": int(getattr(slide, "source_bit_depth", 8) or 8),
         "Channel": channel,
     }
+    if getattr(slide, "modality", "unknown") == "fluorescence":
+        metadata["Description"] = "Modality=fluorescence"
     if mpp_x > 0:
         metadata.update({"PhysicalSizeX": mpp_x, "PhysicalSizeXUnit": "µm"})
     if mpp_y > 0:
@@ -77,7 +78,7 @@ def _field_metadata(slide, field_index: int) -> dict[str, Any]:
     if any(value is not None for value in exposures):
         metadata["Plane"] = [
             (
-                {"ExposureTime": float(exposures[channel_index])}
+                {"ExposureTime": float(exposures[channel_index]), "ExposureTimeUnit": "s"}
                 if exposures[channel_index] is not None
                 else {}
             )
@@ -310,7 +311,13 @@ def write_ome_tiff(
     cancel_event=None,
 ) -> int:
     output_path = Path(output_path)
-    if getattr(slide, "modality", "brightfield") == "fluorescence":
+    if (
+        getattr(slide, "modality", "brightfield") == "fluorescence"
+        or (
+            getattr(slide, "source_container", "") == "ome_tiff"
+            and bool(getattr(slide, "supports_native_planes", False))
+        )
+    ):
         return _write_fluorescence_ome(
             slide,
             output_path,

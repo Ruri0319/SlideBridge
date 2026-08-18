@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import threading
 from typing import Any, Callable
 import xml.etree.ElementTree as ET
 
@@ -37,6 +39,22 @@ SUPPORTED_INPUT_SUFFIXES = {
 class ChannelOverrideError(RuntimeError):
     diagnostic_code = "channel_override_mismatch"
     diagnostic_stage = "preflight"
+
+
+class InspectionCancelled(RuntimeError):
+    pass
+
+
+_INSPECTION_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _inspect_file_bounded(path: Path, cancel_event=None) -> InputInspection:
+    if cancel_event is not None and cancel_event.is_set():
+        raise InspectionCancelled("预检已取消")
+    with _INSPECTION_SLOTS:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InspectionCancelled("预检已取消")
+        return inspect_file(path)
 
 
 def detect_input_format(path: str | Path) -> str:
@@ -106,14 +124,16 @@ def _color(value: Any) -> tuple[int, int, int]:
 
 
 def channel_definitions(slide, overrides: list[dict[str, Any]] | None = None) -> list[ChannelDefinition]:
-    if getattr(slide, "modality", "brightfield") != "fluorescence":
+    modality = getattr(slide, "modality", "brightfield")
+    has_native_planes = bool(getattr(slide, "supports_native_planes", False))
+    if modality != "fluorescence" and not (modality == "unknown" and has_native_planes):
         if overrides:
             raise ChannelOverrideError("明场或未知模态文件不能应用荧光通道定义")
         return []
     count = int(getattr(slide, "native_channel_count", 0) or 0)
     if count <= 0:
         source_count = int(getattr(slide, "source_channel_count", getattr(slide, "channels", 3)) or 1)
-        count = source_count if getattr(slide, "modality", "brightfield") == "fluorescence" else 0
+        count = source_count if modality == "fluorescence" or has_native_planes else 0
     raw_metadata = list(getattr(slide, "channel_metadata", []) or [])
     override_by_index: dict[int, dict[str, Any]] = {}
     if overrides is not None:
@@ -127,7 +147,7 @@ def channel_definitions(slide, overrides: list[dict[str, Any]] | None = None) ->
         override = override_by_index.get(index)
         name = str(source.get("name") or "").strip()
         identity_source = str(source.get("identity_source") or ("source_metadata" if name else "unknown"))
-        fluor = str(source.get("fluor") or name).strip() or None
+        fluor = str(source.get("fluor") or "").strip() or None
         color = _color(source.get("color"))
         excitation_nm = _float_or_none(source.get("excitation_nm"))
         emission_nm = _float_or_none(source.get("emission_nm"))
@@ -274,14 +294,50 @@ def inspect_inputs(
     input_dir: str | Path,
     recursive: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    discovered_callback: Callable[[int, dict[str, int]], None] | None = None,
+    file_callback: Callable[[int, int, InputInspection], None] | None = None,
+    cancel_event=None,
+    max_workers: int = 4,
 ) -> BatchInspection:
     root = Path(input_dir)
     files = find_inspectable_files(root, recursive=recursive)
-    inspected: list[InputInspection] = []
-    for index, path in enumerate(files, start=1):
-        if progress_callback is not None:
-            progress_callback(index - 1, len(files), str(path))
-        inspected.append(inspect_file(path))
+    candidate_counts: dict[str, int] = {}
+    for path in files:
+        label = path.suffix.lower().lstrip(".") or "unknown"
+        candidate_counts[label] = candidate_counts.get(label, 0) + 1
+    if discovered_callback is not None:
+        discovered_callback(len(files), candidate_counts)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise InspectionCancelled("预检已取消")
+
+    inspected: list[InputInspection | None] = [None] * len(files)
+    worker_count = max(1, min(4, int(max_workers), len(files))) if files else 1
+    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="slidebridge-inspect")
+    cancelled = False
+    try:
+        future_indexes = {
+            executor.submit(_inspect_file_bounded, path, cancel_event): index
+            for index, path in enumerate(files)
+        }
+        done_count = 0
+        for future in as_completed(future_indexes):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                for pending in future_indexes:
+                    pending.cancel()
+                raise InspectionCancelled("预检已取消")
+            index = future_indexes[future]
+            result = future.result()
+            inspected[index] = result
+            done_count += 1
+            if progress_callback is not None:
+                progress_callback(done_count, len(files), str(files[index]))
+            if file_callback is not None:
+                file_callback(done_count, len(files), result)
+    finally:
+        executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
+
     if progress_callback is not None:
         progress_callback(len(files), len(files), "")
-    return BatchInspection(root, recursive, tuple(inspected))
+    return BatchInspection(root, recursive, tuple(item for item in inspected if item is not None))

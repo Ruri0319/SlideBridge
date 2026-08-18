@@ -2,6 +2,7 @@ export type OutputFormat = "ome_tiff" | "svs" | "fluorescence_svs" | "afi";
 export type ThemeMode = "auto" | "light" | "dark";
 export type ActualTheme = "light" | "dark";
 export type ViewKey = "new" | "settings";
+export type TaskStatus = "idle" | "inspecting" | "ready" | "starting" | "running" | "success" | "error" | "cancelled";
 
 export interface ThemeSettings {
   mode: ThemeMode;
@@ -27,6 +28,14 @@ export interface ConversionRequest {
   convert_compatible_only: boolean;
   channel_overrides: Record<string, ChannelDefinition[]>;
   input_signatures: Record<string, { size: number; mtime_ns: string }>;
+  preflight_files: InputInspection[];
+}
+
+export interface WorkerStatus {
+  alive: boolean;
+  ready: boolean;
+  activity: "initializing" | "idle" | "inspecting" | "converting" | "unavailable";
+  job_id: string | null;
 }
 
 export interface InspectionRequest {
@@ -127,8 +136,10 @@ export type ConversionEvent =
   | { type: "ready"; banner?: string }
   | { type: "started"; job_id: string }
   | { type: "inspection_started"; job_id: string }
+  | { type: "inspection_discovered"; job_id: string; total: number; format_counts: Record<string, number> }
+  | { type: "inspection_file_done"; job_id: string; done: number; total: number; current: string; file: InputInspection }
   | { type: "inspection_progress"; job_id: string; done: number; total: number; current: string }
-  | { type: "inspection_done"; job_id: string; inspection: BatchInspection }
+  | { type: "inspection_done"; job_id: string; inspection: BatchInspection; duration_ms?: number }
   | { type: "inspection_error"; job_id?: string | null; message: string; traceback?: string }
   | { type: "log"; job_id?: string | null; message: string }
   | { type: "report_path"; job_id?: string; path: string }
@@ -146,11 +157,18 @@ export type ConversionEvent =
     }
   | { type: "done"; job_id: string; batch: BatchPayload }
   | { type: "error"; job_id?: string | null; message: string; traceback?: string; diagnostic_code?: string | null; diagnostic_stage?: string | null }
-  | { type: "worker_terminated"; code?: number | null; signal?: number | null };
+  | {
+      type: "worker_terminated";
+      code?: number | null;
+      signal?: number | null;
+      busy?: boolean;
+      activity?: WorkerStatus["activity"];
+      job_id?: string | null;
+    };
 
 export interface ProgressState {
   running: boolean;
-  statusText: string;
+  status: TaskStatus;
   currentFile: string;
   currentPhase: string;
   stagePercent: number;
@@ -165,4 +183,8 @@ export interface ProgressState {
   reportPath: string;
   outputDir: string;
   startedAt: number | null;
+  finishedAt: number | null;
+  successCount: number;
+  failedCount: number;
+  skippedCount: number;
 }
