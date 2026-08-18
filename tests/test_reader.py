@@ -94,6 +94,7 @@ class ReaderTests(unittest.TestCase):
                 "INSERT INTO tbl_user_info VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (1, "USER-01", "", 0, 0, 1, 123),
             )
+        connection.close()
 
         with IBLSlide(self.path) as slide:
             self.assertEqual(slide.get_macro_image().size, (6, 2))
@@ -117,6 +118,7 @@ class ReaderTests(unittest.TestCase):
                 "INSERT INTO tbl_airimg_info(id, data) VALUES (?, ?)",
                 (1, jpeg_bytes((11, 22, 33), (7, 4))),
             )
+        connection.close()
 
         with IBLSlide(self.path) as slide:
             label = slide.get_label_image()
@@ -143,6 +145,7 @@ class ReaderTests(unittest.TestCase):
                 "INSERT INTO tbl_img_info VALUES (?, 0, 0, 0, 0, 0, ?, ?, ?, ?)",
                 (1, 1, 0, 0, 0),
             )
+        connection.close()
 
         with self.assertRaisesRegex(RuntimeError, "不完整"):
             IBLSlide(broken)
