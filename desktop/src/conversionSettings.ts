@@ -5,7 +5,9 @@ const LEGACY_SETTINGS_KEY = "ibl2svs.conversion.settings";
 
 export const defaultConversionSettings: ConversionSettings = {
   parallel_wsi: 1,
-  jpeg_quality: 90,
+  main_quality: 90,
+  preview_quality: 70,
+  pyramid_quality: 60,
   memory_budget_mb: 6144,
 };
 
@@ -18,7 +20,9 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 export function normalizeConversionSettings(settings: Partial<ConversionSettings>): ConversionSettings {
   return {
     parallel_wsi: clampNumber(settings.parallel_wsi, defaultConversionSettings.parallel_wsi, 1, 8),
-    jpeg_quality: clampNumber(settings.jpeg_quality, defaultConversionSettings.jpeg_quality, 1, 100),
+    main_quality: clampNumber(settings.main_quality, defaultConversionSettings.main_quality, 1, 100),
+    preview_quality: clampNumber(settings.preview_quality, defaultConversionSettings.preview_quality, 1, 100),
+    pyramid_quality: clampNumber(settings.pyramid_quality, defaultConversionSettings.pyramid_quality, 1, 100),
     memory_budget_mb: clampNumber(settings.memory_budget_mb, defaultConversionSettings.memory_budget_mb, 1024, 65536),
   };
 }

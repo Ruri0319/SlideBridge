@@ -181,14 +181,33 @@ class TiffSlideSource:
         self.supports_native_planes = False
         self.supports_plane_jpeg_passthrough = False
         self.source_container = "svs" if self.path.suffix.lower() == ".svs" else "tiff"
-        self.source_version = None
+        description = self._page.description or ""
+        version_match = re.match(r"Aperio Image Library v([^\r\n]+)", description.strip())
+        self.aperio_library_version = version_match.group(1).strip() if version_match else None
+        self.source_version = self.aperio_library_version
         self.source_codec = "JPEG" if compression in JPEG_COMPRESSION_IDS else str(self._page.compression.name)
+        profile_tag = self._page.tags.get(34675)
+        profile_value = getattr(profile_tag, "value", None) if profile_tag is not None else None
+        self.icc_profile = bytes(profile_value) if isinstance(profile_value, bytes) else None
+        self.icc_profile_name = self._description_property(description, "ICC Profile") or (
+            "embedded" if self.icc_profile is not None else "sRGB"
+        )
         self.native_axes = "YXS" if samples > 1 else "YX"
         self.compatibility_level = "static_unverified"
         self.mpp_x = 0.0
         self.mpp_y = 0.0
         self.tile_size = int(getattr(self._page, "tilewidth", 0) or 256)
         self._field_series = [self._tif.series[0]]
+        self.svs_level_dimensions: list[tuple[int, int]] = []
+        if self.source_container == "svs":
+            self.svs_level_dimensions = [
+                (int(page.imagewidth), int(page.imagelength))
+                for page in self._tif.pages
+                if getattr(page, "is_tiled", False)
+                and int(getattr(page, "subfiletype", 0) or 0) == 0
+            ]
+            if not self.svs_level_dimensions or self.svs_level_dimensions[0] != (self.width, self.height):
+                self.svs_level_dimensions = []
         self._associated_series = {
             str(getattr(series, "name", "") or "").strip().lower(): series
             for series in self._tif.series
@@ -198,7 +217,7 @@ class TiffSlideSource:
         if self._tif.ome_metadata:
             self._configure_ome_semantics(self._tif.ome_metadata)
         else:
-            self._configure_aperio_semantics(self._page.description or "")
+            self._configure_aperio_semantics(description)
 
         if (
             self.source_container == "ome_tiff" and self.modality != "brightfield"

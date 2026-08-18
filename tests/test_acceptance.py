@@ -87,7 +87,15 @@ class AcceptanceSummaryTests(unittest.TestCase):
                 tile_height=256,
             )
 
-            result = convert_file(sample, output, ConvertOptions(tile_size=16, output_format="svs"))
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_synthesize_associated_images=True,
+                ),
+            )
             summary = summarize_wsi_output(output)
 
             self.assertTrue(result.success)

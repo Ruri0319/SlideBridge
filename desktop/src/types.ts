@@ -10,7 +10,9 @@ export interface ThemeSettings {
 
 export interface ConversionSettings {
   parallel_wsi: number;
-  jpeg_quality: number;
+  main_quality: number;
+  preview_quality: number;
+  pyramid_quality: number;
   memory_budget_mb: number;
 }
 
@@ -22,8 +24,11 @@ export interface ConversionRequest {
   recursive: boolean;
   memory_budget_mb: number;
   tile_size: number;
-  jpeg_quality: number;
+  main_quality: number;
+  preview_quality: number;
+  pyramid_quality: number;
   parallel_wsi: number;
+  output_to_new_subfolder: boolean;
   selected_input_paths: string[] | null;
   convert_compatible_only: boolean;
   channel_overrides: Record<string, ChannelDefinition[]>;
@@ -142,6 +147,7 @@ export type ConversionEvent =
   | { type: "inspection_done"; job_id: string; inspection: BatchInspection; duration_ms?: number }
   | { type: "inspection_error"; job_id?: string | null; message: string; traceback?: string }
   | { type: "log"; job_id?: string | null; message: string }
+  | { type: "output_dir"; job_id?: string; path: string }
   | { type: "report_path"; job_id?: string; path: string }
   | { type: "overall"; job_id?: string; done: number; total: number; current: string }
   | { type: "performance"; job_id?: string; memory_mb: number; cpu_percent: number }

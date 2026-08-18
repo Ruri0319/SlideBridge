@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import tempfile
 import unittest
 import sqlite3
@@ -8,7 +9,7 @@ import numpy as np
 
 from ibl2svs.reader import IBLSlide
 
-from tests.support import create_sample_ibl
+from tests.support import create_sample_ibl, jpeg_bytes
 
 
 class ReaderTests(unittest.TestCase):
@@ -39,6 +40,94 @@ class ReaderTests(unittest.TestCase):
             preview1 = slide.assemble_preview_from_layer1()
             self.assertEqual(preview0.size, (2, 2))
             self.assertEqual(preview1.size, (2, 2))
+
+    def test_reader_uses_tile_geometry_for_expected_tile_count(self) -> None:
+        self.path.unlink()
+        create_sample_ibl(
+            self.path,
+            img_width=6,
+            img_height=4,
+            tile_width=4,
+            tile_height=3,
+            include_preview=False,
+            include_shrink=False,
+        )
+
+        with IBLSlide(self.path) as slide:
+            block = slide.get_block_array(slide.blocks[0])
+            self.assertEqual(block.shape, (4, 6, 3))
+
+    def test_reader_uses_native_ext_images_and_scan_metadata(self) -> None:
+        self.path.unlink()
+        create_sample_ibl(self.path, include_preview=False, include_shrink=False)
+        with sqlite3.connect(self.path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE tbl_ext_info (
+                    id INTEGER UNIQUE,
+                    type INTEGER,
+                    data BLOB,
+                    PRIMARY KEY(id AUTOINCREMENT)
+                );
+                CREATE TABLE tbl_user_info (
+                    id INTEGER UNIQUE,
+                    deviceNo TEXT,
+                    slideSource TEXT,
+                    slideType INTEGER,
+                    scanMode INTEGER,
+                    scanLayer INTEGER,
+                    scanTime INTEGER,
+                    PRIMARY KEY(id AUTOINCREMENT)
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO tbl_ext_info(type, data) VALUES (?, ?)",
+                [
+                    (1, jpeg_bytes((10, 20, 30), (6, 2))),
+                    (2, jpeg_bytes((40, 50, 60), (3, 1))),
+                    (3, jpeg_bytes((70, 80, 90), (2, 5))),
+                    (6, json.dumps({"deviceNo": "EXT-01", "packetTime": "2024/04/12 09:43:56", "scanTime": 12.5}).encode("utf-8")),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO tbl_user_info VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (1, "USER-01", "", 0, 0, 1, 123),
+            )
+
+        with IBLSlide(self.path) as slide:
+            self.assertEqual(slide.get_macro_image().size, (6, 2))
+            self.assertEqual(slide.get_thumbnail_image().size, (3, 1))
+            self.assertEqual(slide.get_label_image().size, (2, 5))
+            self.assertIsNone(slide.get_overview_image())
+            metadata = slide.get_scan_metadata()
+            self.assertEqual(metadata["deviceNo"], "EXT-01")
+            self.assertEqual(metadata["scanTime"], "2024/04/12 09:43:56")
+            self.assertEqual(metadata["scanDuration"], 12.5)
+            self.assertEqual(metadata["userScanTime"], 123)
+
+    def test_reader_uses_legacy_airimg_info_as_label(self) -> None:
+        self.path.unlink()
+        create_sample_ibl(self.path, include_preview=False, include_shrink=False)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "CREATE TABLE tbl_airimg_info (id INTEGER PRIMARY KEY, data BLOB)"
+            )
+            connection.execute(
+                "INSERT INTO tbl_airimg_info(id, data) VALUES (?, ?)",
+                (1, jpeg_bytes((11, 22, 33), (7, 4))),
+            )
+
+        with IBLSlide(self.path) as slide:
+            label = slide.get_label_image()
+            self.assertIsNotNone(label)
+            self.assertEqual(label.size, (7, 4))
+            self.assertTrue(
+                all(
+                    abs(actual - expected) <= 2
+                    for actual, expected in zip(label.getpixel((0, 0)), (11, 22, 33))
+                )
+            )
 
     def test_reader_rejects_incomplete_tiles(self) -> None:
         broken = Path(self.tempdir.name) / "broken.ibl"

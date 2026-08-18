@@ -157,6 +157,17 @@ def _bounded_int(payload: dict[str, Any], key: str, default: int, minimum: int, 
     return max(minimum, min(maximum, value))
 
 
+def _create_output_subfolder(output_root: Path) -> Path:
+    prefix = f"SlideBridge_{datetime.now().strftime('%Y%m%d%H%M')}"
+    candidate = output_root / prefix
+    suffix = 1
+    while candidate.exists():
+        candidate = output_root / f"{prefix}_{suffix}"
+        suffix += 1
+    candidate.mkdir()
+    return candidate
+
+
 def options_from_request(payload: dict[str, Any]) -> ConvertOptions:
     output_format = str(payload.get("output_format", "ome_tiff"))
     if output_format not in {"ome_tiff", "svs", "fluorescence_svs", "afi"}:
@@ -166,7 +177,9 @@ def options_from_request(payload: dict[str, Any]) -> ConvertOptions:
         output_format=output_format,  # type: ignore[arg-type]
         memory_budget_mb=_bounded_int(payload, "memory_budget_mb", 6144, 1024, 65536),
         tile_size=_bounded_int(payload, "tile_size", 256, 16, 4096),
-        jpeg_quality=_bounded_int(payload, "jpeg_quality", 90, 1, 100),
+        main_quality=_bounded_int(payload, "main_quality", 90, 1, 100),
+        preview_quality=_bounded_int(payload, "preview_quality", 70, 1, 100),
+        pyramid_quality=_bounded_int(payload, "pyramid_quality", 60, 1, 100),
         parallel_wsi=_bounded_int(payload, "parallel_wsi", 1, 1, 8),
         selected_input_paths=(
             tuple(str(path) for path in payload.get("selected_input_paths", []))
@@ -244,12 +257,17 @@ class BackendWorker:
             job_id = str(message.get("job_id") or int(time.time() * 1000))
             payload = message.get("payload", message)
             input_dir = Path(str(payload.get("input_dir", ""))).expanduser()
-            output_dir = Path(str(payload.get("output_dir", ""))).expanduser()
+            output_root = Path(str(payload.get("output_dir", ""))).expanduser()
             if not input_dir.is_dir():
                 raise WorkerProtocolError(f"invalid input_dir: {input_dir}")
-            output_dir.mkdir(parents=True, exist_ok=True)
-            if not output_dir.is_dir():
-                raise WorkerProtocolError(f"invalid output_dir: {output_dir}")
+            output_root.mkdir(parents=True, exist_ok=True)
+            if not output_root.is_dir():
+                raise WorkerProtocolError(f"invalid output_dir: {output_root}")
+            output_dir = (
+                _create_output_subfolder(output_root)
+                if bool(payload.get("output_to_new_subfolder", False))
+                else output_root
+            )
             options = options_from_request(payload)
             self._cancel_event = threading.Event()
             self._current_job_id = job_id
@@ -337,6 +355,7 @@ class BackendWorker:
         terminal_type = "done"
         terminal_payload: dict[str, Any]
         try:
+            self.emit("output_dir", job_id=job_id, path=str(output_dir))
             self.emit("report_path", job_id=job_id, path=str(log_path))
             batch = convert_folder(
                 input_dir,

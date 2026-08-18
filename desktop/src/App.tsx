@@ -203,13 +203,14 @@ export default function App() {
   const [outputDir, setOutputDir] = useState("");
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("ome_tiff");
   const [recursive, setRecursive] = useState(true);
+  const [outputToNewSubfolder, setOutputToNewSubfolder] = useState(false);
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [phaseStates, setPhaseStates] = useState<PhaseDisplayState[]>(() => initialPhaseStates());
   const [logs, setLogs] = useState<string[]>([]);
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(() => loadThemeSettings());
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>(() => loadConversionSettings());
   const [taskSettings, setTaskSettings] = useState<ConversionSettings | null>(null);
-  const [appVersion, setAppVersion] = useState("0.4.5");
+  const [appVersion, setAppVersion] = useState("0.5.0");
   const [actualTheme, setActualTheme] = useState<ActualTheme>(() => resolveTheme(loadThemeSettings()).theme);
   const [inspection, setInspection] = useState<BatchInspection | null>(null);
   const [inspectionStatus, setInspectionStatus] = useState<"idle" | "running" | "ready" | "error">("idle");
@@ -412,6 +413,11 @@ export default function App() {
     }
     if (event.type === "started") {
       setProgress((state) => ({ ...state, running: true, status: "running" }));
+      return;
+    }
+    if (event.type === "output_dir") {
+      setProgress((state) => ({ ...state, outputDir: event.path }));
+      appendLog(`本次输出目录: ${event.path}`);
       return;
     }
     if (event.type === "report_path") {
@@ -650,8 +656,11 @@ export default function App() {
         recursive,
         memory_budget_mb: settingsSnapshot.memory_budget_mb,
         tile_size: 256,
-        jpeg_quality: settingsSnapshot.jpeg_quality,
+        main_quality: settingsSnapshot.main_quality,
+        preview_quality: settingsSnapshot.preview_quality,
+        pyramid_quality: settingsSnapshot.pyramid_quality,
         parallel_wsi: settingsSnapshot.parallel_wsi,
+        output_to_new_subfolder: outputToNewSubfolder,
         selected_input_paths: inspection.files.map((file) => file.input_path),
         convert_compatible_only: convertCompatibleOnly,
         channel_overrides: channelOverrides,
@@ -800,7 +809,7 @@ export default function App() {
               <TaskStatusBanner
                 progress={progress}
                 inspectionMessage={inspectionMessage}
-                onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
+                onOpenOutput={() => openPathWithFeedback(progress.outputDir || outputDir, "打开输出目录")}
                 onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
               />
               <div className="phase-list">
@@ -841,6 +850,7 @@ export default function App() {
             outputFormat={outputFormat}
             conversionSettings={conversionSettings}
             recursive={recursive}
+            outputToNewSubfolder={outputToNewSubfolder}
             canStart={canStart}
             running={progress.running}
             taskStatus={progress.status}
@@ -857,11 +867,12 @@ export default function App() {
             onOutput={pickOutput}
             onFormat={setOutputFormat}
             onRecursive={setRecursive}
+            onOutputToNewSubfolder={setOutputToNewSubfolder}
             onStart={runConversion}
             onCancel={cancelCurrent}
             onReset={resetTask}
             onEditChannels={editChannels}
-            onOpenOutput={() => openPathWithFeedback(outputDir, "打开输出目录")}
+            onOpenOutput={() => openPathWithFeedback(progress.outputDir || outputDir, "打开输出目录")}
             onOpenReport={() => openPathWithFeedback(progress.reportPath, "打开转换报告")}
           />
         )}
@@ -1011,8 +1022,16 @@ function PerformanceSummary({
           <dd>{settings.parallel_wsi}</dd>
         </div>
         <div>
-          <dt>JPG 质量</dt>
-          <dd>{settings.jpeg_quality}</dd>
+          <dt>主图 JPG</dt>
+          <dd>{settings.main_quality}</dd>
+        </div>
+        <div>
+          <dt>预览图 JPG</dt>
+          <dd>{settings.preview_quality}</dd>
+        </div>
+        <div>
+          <dt>金字塔 JPG</dt>
+          <dd>{settings.pyramid_quality}</dd>
         </div>
         <div>
           <dt>ETA</dt>
@@ -1056,6 +1075,7 @@ export function TaskComposer({
   outputFormat,
   conversionSettings,
   recursive,
+  outputToNewSubfolder,
   canStart,
   running,
   taskStatus,
@@ -1072,6 +1092,7 @@ export function TaskComposer({
   onOutput,
   onFormat,
   onRecursive,
+  onOutputToNewSubfolder,
   onStart,
   onCancel,
   onReset,
@@ -1084,6 +1105,7 @@ export function TaskComposer({
   outputFormat: OutputFormat;
   conversionSettings: ConversionSettings;
   recursive: boolean;
+  outputToNewSubfolder: boolean;
   canStart: boolean;
   running: boolean;
   taskStatus: TaskStatus;
@@ -1100,6 +1122,7 @@ export function TaskComposer({
   onOutput: () => void;
   onFormat: (format: OutputFormat) => void;
   onRecursive: (value: boolean) => void;
+  onOutputToNewSubfolder: (value: boolean) => void;
   onStart: () => void;
   onCancel: () => void;
   onReset: () => void;
@@ -1148,10 +1171,18 @@ export function TaskComposer({
             </button>
           ))}
         </div>
-        <label className="check-row">
-          <input type="checkbox" checked={recursive} disabled={running} onChange={(event) => onRecursive(event.target.checked)} />
-          包含子文件夹
-        </label>
+        <div className="task-options">
+          <label className="check-row">
+            <input type="checkbox" checked={recursive} disabled={running} onChange={(event) => onRecursive(event.target.checked)} />
+            <span className="check-mark" aria-hidden="true"><Check size={13} strokeWidth={3} /></span>
+            <span>扫描子文件夹</span>
+          </label>
+          <label className="check-row">
+            <input type="checkbox" checked={outputToNewSubfolder} disabled={running} onChange={(event) => onOutputToNewSubfolder(event.target.checked)} />
+            <span className="check-mark" aria-hidden="true"><Check size={13} strokeWidth={3} /></span>
+            <span>输出至新子文件夹</span>
+          </label>
+        </div>
         <button className="primary" disabled={!canStart} onClick={onStart}>
           {taskStatus === "starting" || taskStatus === "running"
             ? <LoaderCircle className="button-spinner" size={16} />
@@ -1177,7 +1208,7 @@ export function TaskComposer({
         </button>
       </div>
       <div className="composer-meta">
-        并行 {conversionSettings.parallel_wsi} · JPEG {conversionSettings.jpeg_quality} · 内存 {conversionSettings.memory_budget_mb} MB
+        并行 {conversionSettings.parallel_wsi} · 主图 {conversionSettings.main_quality} · 预览图 {conversionSettings.preview_quality} · 金字塔 {conversionSettings.pyramid_quality} · 内存 {conversionSettings.memory_budget_mb} MB
       </div>
     </section>
   );
@@ -1564,21 +1595,41 @@ function SettingsView({
         </div>
       </div>
       <div className="settings-group">
-        <label>转换参数</label>
-        <div className="settings-grid">
+        <label>图像质量</label>
+        <div className="settings-grid quality-settings-grid">
+          <StepperField
+            label="主图 JPG Quality"
+            value={conversionSettings.main_quality}
+            min={1}
+            max={100}
+            onChange={(value) => onConversionChange({ ...conversionSettings, main_quality: value })}
+          />
+          <StepperField
+            label="预览图 JPG Quality"
+            value={conversionSettings.preview_quality}
+            min={1}
+            max={100}
+            onChange={(value) => onConversionChange({ ...conversionSettings, preview_quality: value })}
+          />
+          <StepperField
+            label="金字塔 JPG Quality"
+            value={conversionSettings.pyramid_quality}
+            min={1}
+            max={100}
+            onChange={(value) => onConversionChange({ ...conversionSettings, pyramid_quality: value })}
+          />
+        </div>
+        <p className="settings-note">三项质量参数同时适用于 JPEG 与 J2K；主图用于科研计算，预览图和金字塔用于阅片显示。</p>
+      </div>
+      <div className="settings-group">
+        <label>性能参数</label>
+        <div className="settings-grid performance-settings-grid">
           <StepperField
             label="同时处理 WSI"
             value={conversionSettings.parallel_wsi}
             min={1}
             max={8}
             onChange={(value) => onConversionChange({ ...conversionSettings, parallel_wsi: value })}
-          />
-          <StepperField
-            label="JPEG quality"
-            value={conversionSettings.jpeg_quality}
-            min={1}
-            max={100}
-            onChange={(value) => onConversionChange({ ...conversionSettings, jpeg_quality: value })}
           />
           <StepperField
             label="内存预算 MB"

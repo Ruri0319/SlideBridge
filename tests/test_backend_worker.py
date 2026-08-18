@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -29,7 +30,9 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertTrue(options.recursive)
         self.assertEqual(options.memory_budget_mb, 6144)
         self.assertEqual(options.tile_size, 256)
-        self.assertEqual(options.jpeg_quality, 90)
+        self.assertEqual(options.main_quality, 90)
+        self.assertEqual(options.preview_quality, 70)
+        self.assertEqual(options.pyramid_quality, 60)
         self.assertEqual(options.parallel_wsi, 1)
 
     def test_options_from_request_clamps_adjustable_backend_settings(self) -> None:
@@ -38,14 +41,18 @@ class BackendWorkerTests(unittest.TestCase):
                 "output_format": "ome_tiff",
                 "memory_budget_mb": 512,
                 "tile_size": 8,
-                "jpeg_quality": 120,
+                "main_quality": 120,
+                "preview_quality": 0,
+                "pyramid_quality": 101,
                 "parallel_wsi": 9,
             }
         )
 
         self.assertEqual(options.memory_budget_mb, 1024)
         self.assertEqual(options.tile_size, 16)
-        self.assertEqual(options.jpeg_quality, 100)
+        self.assertEqual(options.main_quality, 100)
+        self.assertEqual(options.preview_quality, 1)
+        self.assertEqual(options.pyramid_quality, 100)
         self.assertEqual(options.parallel_wsi, 8)
 
     def test_options_from_request_accepts_parallel_wsi_upper_limit(self) -> None:
@@ -194,7 +201,7 @@ class BackendWorkerTests(unittest.TestCase):
             output_dir = root / "output"
             input_dir.mkdir()
 
-            with mock.patch("ibl2svs.backend_worker.convert_folder", return_value=batch):
+            with mock.patch("ibl2svs.backend_worker.convert_folder", return_value=batch) as convert_folder:
                 worker.start_job(
                     {
                         "type": "start",
@@ -203,11 +210,16 @@ class BackendWorkerTests(unittest.TestCase):
                             "input_dir": str(input_dir),
                             "output_dir": str(output_dir),
                             "output_format": "ome_tiff",
+                            "output_to_new_subfolder": True,
                         },
                     }
                 )
                 assert worker._thread is not None
                 worker._thread.join(timeout=2)
+                actual_output_dir = convert_folder.call_args.args[1]
+                self.assertEqual(actual_output_dir.parent, output_dir)
+                self.assertRegex(actual_output_dir.name, re.compile(r"SlideBridge_\d{12}(?:_\d+)?"))
+                self.assertTrue(actual_output_dir.is_dir())
 
         events = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(events[0]["type"], "started")
@@ -217,6 +229,8 @@ class BackendWorkerTests(unittest.TestCase):
         self.assertLessEqual(performance["cpu_percent"], 100)
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["job_id"], "job-1")
+        output_event = next(event for event in events if event["type"] == "output_dir")
+        self.assertEqual(output_event["path"], str(actual_output_dir))
 
     def test_conversion_state_is_idle_before_terminal_event(self) -> None:
         worker = BackendWorker(stdin=io.StringIO(), stdout=io.StringIO())

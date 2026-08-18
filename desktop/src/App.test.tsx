@@ -91,7 +91,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
   conversionEventHandler = null;
-  apiMocks.getApplicationVersion.mockResolvedValue("0.4.5");
+  apiMocks.getApplicationVersion.mockResolvedValue("0.5.0");
   apiMocks.ensureWorker.mockResolvedValue({ alive: true, ready: true, activity: "idle", job_id: null });
   apiMocks.onConversionEvent.mockImplementation(async (callback: (event: ConversionEvent) => void) => {
     conversionEventHandler = callback;
@@ -199,8 +199,9 @@ describe("inspection and task feedback", () => {
         inputDir="/slides"
         outputDir="/output"
         outputFormat="ome_tiff"
-        conversionSettings={{ parallel_wsi: 1, jpeg_quality: 90, memory_budget_mb: 4096 }}
+        conversionSettings={{ parallel_wsi: 1, main_quality: 90, preview_quality: 70, pyramid_quality: 60, memory_budget_mb: 4096 }}
         recursive
+        outputToNewSubfolder={false}
         canStart={false}
         running
         taskStatus="starting"
@@ -217,6 +218,7 @@ describe("inspection and task feedback", () => {
         onOutput={vi.fn()}
         onFormat={vi.fn()}
         onRecursive={vi.fn()}
+        onOutputToNewSubfolder={vi.fn()}
         onStart={vi.fn()}
         onCancel={vi.fn()}
         onReset={vi.fn()}
@@ -228,6 +230,8 @@ describe("inspection and task feedback", () => {
     for (const label of ["Pyramidal OME-TIFF", "明场 SVS", "荧光 SVS", "AFI"]) {
       expect((screen.getByRole("button", { name: new RegExp(label) }) as HTMLButtonElement).disabled).toBe(true);
     }
+    expect(screen.getByText("扫描子文件夹")).toBeTruthy();
+    expect(screen.getByText("输出至新子文件夹")).toBeTruthy();
   });
 });
 

@@ -8,6 +8,13 @@ from typing import Any, Literal
 
 OutputFormat = Literal["ome_tiff", "svs", "fluorescence_svs", "afi"]
 SourceModality = Literal["brightfield", "fluorescence", "unknown"]
+SvsCodec = Literal["auto", "jpeg_rgb", "aperio_j2k"]
+SVS_J2K_SOURCE_CODECS = {
+    "APERIO_JP2000_YCBC",
+    "APERIO_JP2000_RGB",
+    "JPEG_2000_LOSSY",
+    "JPEG2000",
+}
 ChannelIdentitySource = Literal[
     "source_metadata",
     "documented_vendor_id",
@@ -109,14 +116,18 @@ class ConvertOptions:
     recursive: bool = True
     output_format: OutputFormat = "ome_tiff"
     performance_backend: Literal["tifffile"] = "tifffile"
+    svs_codec: SvsCodec = "auto"
     svs_use_bigtiff: bool | Literal["auto"] = "auto"
     svs_generate_label: bool = True
     svs_generate_macro: bool = True
+    svs_synthesize_associated_images: bool = False
+    main_quality: int = 90
+    preview_quality: int = 70
+    pyramid_quality: int = 60
     svs_finalize_with_libtiff: bool = True
     svs_validate_with_tiffinfo: bool = True
     chunk_size: int | None = None
     tile_size: int = 256
-    jpeg_quality: int = 90
     memory_budget_mb: int = 6144
     gui_log_limit: int = 2000
     generate_dense_pyramid: bool = True
@@ -139,8 +150,24 @@ class ConvertOptions:
             return 256
         return self.tile_size
 
-    def resolved_jpeg_quality(self) -> int:
-        return self.jpeg_quality
+    def resolved_svs_codec(self, source_codec: str | None = None) -> Literal["jpeg_rgb", "aperio_j2k"]:
+        if self.svs_codec == "jpeg_rgb":
+            return "jpeg_rgb"
+        if self.svs_codec == "aperio_j2k":
+            return "aperio_j2k"
+        if str(source_codec or "").upper() in SVS_J2K_SOURCE_CODECS:
+            return "aperio_j2k"
+        return "jpeg_rgb"
+
+    def resolved_svs_tile_size(self, source_codec: str | None = None) -> int:
+        if self.output_format != "svs":
+            return self.resolved_tile_size()
+        if self.tile_size == 256 and self.resolved_svs_codec(source_codec) == "aperio_j2k":
+            return 256
+        return self.resolved_tile_size()
+
+    def resolved_main_quality(self) -> int:
+        return self.main_quality
 
     def resolved_encoder_workers(self) -> int:
         if self.encoder_workers is not None:

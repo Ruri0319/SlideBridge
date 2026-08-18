@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
@@ -16,6 +17,7 @@ from .models import BaseInfo, BlockRecord
 
 REQUIRED_TABLES = {"tbl_base_info", "tbl_img_info", "tbl_tile_info"}
 OPTIONAL_TABLES = {"tbl_shrink_info"}
+EXT_IMAGE_TYPES = {"macro": 1, "thumbnail": 2, "label": 3}
 
 
 class IBLValidationError(RuntimeError):
@@ -35,6 +37,11 @@ class IBLSlide:
             }
             self._block_cache: OrderedDict[int, np.ndarray] = OrderedDict()
             self.base_info = self._load_base_info()
+            self.source_container = "ibl"
+            self.source_version = self.base_info.version
+            self.source_codec = "JPEG"
+            self._associated_cache: dict[str, Image.Image] = {}
+            self._ext_json_cache: dict[int, object] = {}
             self.modality = "brightfield"
             self.native_fields = (0,)
             self.native_channel_count = 1
@@ -222,6 +229,11 @@ class IBLSlide:
             for block in self.blocks
         }
 
+    def _expected_full_resolution_tile_count(self) -> int:
+        columns = (self.base_info.img_width + self.base_info.tile_width - 1) // self.base_info.tile_width
+        rows = (self.base_info.img_height + self.base_info.tile_height - 1) // self.base_info.tile_height
+        return columns * rows
+
     def _validate_tile_integrity(self) -> None:
         counts = self._con.execute(
             """
@@ -234,14 +246,24 @@ class IBLSlide:
         if not counts:
             raise IBLValidationError("tbl_tile_info 中没有全分辨率 layer=0 数据")
 
+        expected_tiles = self._expected_full_resolution_tile_count()
         counts_by_id = {int(row["id"]): int(row["n"]) for row in counts}
-        bad = [block.block_id for block in self.blocks if counts_by_id.get(block.block_id, 0) != 16]
+        bad = [
+            block.block_id
+            for block in self.blocks
+            if counts_by_id.get(block.block_id, 0) != expected_tiles
+        ]
         if bad:
-            raise IBLValidationError(f"存在不完整的全分辨率块，示例 block_id={bad[0]}")
+            raise IBLValidationError(
+                f"存在不完整的全分辨率块，期望每块 {expected_tiles} 个子瓦片，示例 block_id={bad[0]}"
+            )
 
     def _decode_block_from_rows(self, block: BlockRecord, rows) -> np.ndarray:
-        if len(rows) != 16:
-            raise IBLValidationError(f"block_id={block.block_id} 的全分辨率子瓦片数量不是 16")
+        expected_tiles = self._expected_full_resolution_tile_count()
+        if len(rows) != expected_tiles:
+            raise IBLValidationError(
+                f"block_id={block.block_id} 的全分辨率子瓦片数量不是 {expected_tiles}"
+            )
 
         canvas = np.full(
             (self.base_info.img_height, self.base_info.img_width, 3),
@@ -425,31 +447,49 @@ class IBLSlide:
     def get_preview_image(self) -> Image.Image | None:
         return self.assemble_preview_from_layer1()
 
-    def assemble_preview_from_layer1(self, scale: int = 4) -> Image.Image | None:
+    def _available_preview_layer(self) -> int | None:
+        row = self._con.execute(
+            "SELECT MIN(layer) AS layer FROM tbl_tile_info WHERE layer > 0"
+        ).fetchone()
+        if row is None or row["layer"] is None:
+            return None
+        return int(row["layer"])
+
+    def _layer_scale(self, layer: int) -> int:
+        return int(self.base_info.ratio_step) ** int(layer)
+
+    def assemble_preview_from_layer1(self, scale: int | None = None) -> Image.Image | None:
+        layer = self._available_preview_layer()
+        if layer is None:
+            return None
+
+        source_scale = self._layer_scale(layer)
+        output_scale = source_scale if scale is None else int(scale)
         rows = self._con.execute(
             """
             SELECT i.nX, i.nY, t.data
             FROM tbl_img_info AS i
             JOIN tbl_tile_info AS t
-              ON t.id = i.id AND t.layer = 1
+              ON t.id = i.id AND t.layer = ?
             ORDER BY i.row, i.col
-            """
+            """,
+            (layer,),
         ).fetchall()
         if not rows:
             return None
 
-        width = (self.width + scale - 1) // scale
-        height = (self.height + scale - 1) // scale
+        width = (self.width + output_scale - 1) // output_scale
+        height = (self.height + output_scale - 1) // output_scale
         background = (self.base_info.background_color,) * 3
         canvas = Image.new("RGB", (width, height), background)
         for row in rows:
             with Image.open(io.BytesIO(row["data"])) as tile_image:
                 tile = tile_image.convert("RGB")
-            if scale != 4:
-                target_width = max(1, (tile.width * 4 + scale - 1) // scale)
-                target_height = max(1, (tile.height * 4 + scale - 1) // scale)
+            if output_scale != source_scale:
+                target_width = max(1, (tile.width * source_scale + output_scale - 1) // output_scale)
+                target_height = max(1, (tile.height * source_scale + output_scale - 1) // output_scale)
                 tile = tile.resize((target_width, target_height), resample=Image.Resampling.BILINEAR)
-            canvas.paste(tile, (int(row["nX"]) // scale, int(row["nY"]) // scale))
+            canvas.paste(tile, (int(row["nX"]) // output_scale, int(row["nY"]) // output_scale))
         return canvas
 
     def assemble_preview_from_layer0(self, scale: int = 4) -> Image.Image:
@@ -509,22 +549,80 @@ class IBLSlide:
         image.save(output_path)
         return output_path
 
+    def _get_ext_blob(self, type_id: int) -> bytes | None:
+        if "tbl_ext_info" not in self.tables:
+            return None
+        row = self._con.execute(
+            "SELECT data FROM tbl_ext_info WHERE type = ? ORDER BY id LIMIT 1",
+            (type_id,),
+        ).fetchone()
+        if row is None or row["data"] is None:
+            return None
+        return bytes(row["data"])
+
+    def _get_ext_image(self, type_id: int) -> Image.Image | None:
+        image_name = next(
+            (name for name, mapped_type in EXT_IMAGE_TYPES.items() if mapped_type == type_id),
+            None,
+        )
+        if image_name is not None:
+            cached = self._associated_cache.get(image_name)
+            if cached is not None:
+                return cached.copy()
+
+        blob = self._get_ext_blob(type_id)
+        if blob is None:
+            return None
+        with Image.open(io.BytesIO(blob)) as image:
+            decoded = image.convert("RGB")
+        if image_name is not None:
+            self._associated_cache[image_name] = decoded
+        return decoded.copy()
+
+    def _get_ext_json(self, type_id: int) -> object | None:
+        if type_id in self._ext_json_cache:
+            return self._ext_json_cache[type_id]
+        blob = self._get_ext_blob(type_id)
+        if blob is None:
+            return None
+        value = json.loads(blob.decode("utf-8"))
+        self._ext_json_cache[type_id] = value
+        return value
+
+    def get_native_associated_image(self, name: str) -> Image.Image | None:
+        """Return an IBL image from tbl_ext_info without synthetic resizing."""
+        return self._get_ext_image(EXT_IMAGE_TYPES[name])
+
+    def get_macro_image(self) -> Image.Image | None:
+        return self._get_ext_image(EXT_IMAGE_TYPES["macro"])
+
     def get_thumbnail_image(self) -> Image.Image | None:
+        native = self._get_ext_image(EXT_IMAGE_TYPES["thumbnail"])
+        if native is not None:
+            return native
         if "tbl_shrink_info" not in self.tables:
             return None
+
+        layer_row = self._con.execute(
+            "SELECT MAX(layerNo) AS layerNo FROM tbl_shrink_info"
+        ).fetchone()
+        if layer_row is None or layer_row["layerNo"] is None:
+            return None
+        layer_no = int(layer_row["layerNo"])
 
         rows = self._con.execute(
             """
             SELECT x, y, data
             FROM tbl_shrink_info
-            WHERE layerNo = 2
+            WHERE layerNo = ?
             ORDER BY y, x
-            """
+            """,
+            (layer_no,),
         ).fetchall()
         if not rows:
             return None
 
-        scale = 16
+        scale = self._layer_scale(layer_no)
         width = (self.width + scale - 1) // scale
         height = (self.height + scale - 1) // scale
         canvas = Image.new("RGB", (width, height), (self.base_info.background_color,) * 3)
@@ -535,27 +633,41 @@ class IBLSlide:
         return canvas
 
     def get_label_image(self) -> Image.Image | None:
-        """Return the native label/overview image stored in *tbl_airimg_info*.
+        native = self._get_ext_image(EXT_IMAGE_TYPES["label"])
+        if native is not None:
+            return native
+        return self.get_overview_image()
 
-        Many IBL files carry a pre-composed JPEG overview (e.g. a slide-label
-        thumbnail captured by the scanner).  When available this is a far
-        better source for the SVS macro / label pages than a synthetic
-        down-sample.
-        """
+    def get_overview_image(self) -> Image.Image | None:
+        """Return the separate overview image stored in tbl_airimg_info."""
         if "tbl_airimg_info" not in self.tables:
             return None
         row = self._con.execute(
-            "SELECT data FROM tbl_airimg_info WHERE id = 1"
+            "SELECT data FROM tbl_airimg_info ORDER BY id LIMIT 1"
         ).fetchone()
-        if row is None:
+        if row is None or row["data"] is None:
             return None
         return Image.open(io.BytesIO(row["data"])).convert("RGB")
 
     def get_scan_metadata(self) -> dict[str, object]:
-        """Return scanner metadata from *tbl_user_info* (device, time, etc.)."""
-        if "tbl_user_info" not in self.tables:
-            return {}
-        row = self._con.execute("SELECT * FROM tbl_user_info WHERE id = 1").fetchone()
-        if row is None:
-            return {}
-        return dict(row)
+        """Return scanner metadata from tbl_user_info and tbl_ext_info type 6."""
+        metadata: dict[str, object] = {}
+        if "tbl_user_info" in self.tables:
+            row = self._con.execute(
+                "SELECT * FROM tbl_user_info ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                metadata.update(dict(row))
+
+        ext_info = self._get_ext_json(6)
+        if isinstance(ext_info, dict):
+            user_scan_time = metadata.get("scanTime")
+            metadata.update(ext_info)
+            if user_scan_time is not None:
+                metadata["userScanTime"] = user_scan_time
+            packet_time = ext_info.get("packetTime")
+            if packet_time:
+                metadata["scanTime"] = packet_time
+            if "scanTime" in ext_info:
+                metadata["scanDuration"] = ext_info["scanTime"]
+        return metadata

@@ -631,8 +631,10 @@ def create_sample_ibl(
                 """,
                 (block_id, grid_col, grid_row, x, y),
             )
-            for row in range(4):
-                for col in range(4):
+            tile_rows = (img_height + tile_height - 1) // tile_height
+            tile_cols = (img_width + tile_width - 1) // tile_width
+            for row in range(tile_rows):
+                for col in range(tile_cols):
                     if grid_col == 0 and grid_row == 0 and omit_tile == (col, row):
                         continue
                     color = (

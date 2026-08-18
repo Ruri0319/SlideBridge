@@ -53,7 +53,7 @@ def build_fluorescence_description(slide, channel_index: int, options: ConvertOp
     return (
         "Aperio Image Library v12.0.0 \r\n"
         f"{slide.width}x{slide.height} [0,0 {slide.width}x{slide.height}] "
-        f"(256x256) JPEG/Monochrome Q={options.jpeg_quality}|"
+        f"(256x256) JPEG/Monochrome Q={options.main_quality}|"
         + "|".join(properties)
     )
 
@@ -212,7 +212,7 @@ def write_fluorescence_svs(
                     slide,
                     level_index,
                     channel_index,
-                    options.jpeg_quality,
+                    options.main_quality,
                     cancel_event,
                 )
             )

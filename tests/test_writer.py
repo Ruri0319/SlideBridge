@@ -16,9 +16,13 @@ from ibl2svs.models import ConvertOptions
 from ibl2svs.punuoxi_source import PunuoxiImageSource
 from ibl2svs.tiff_source import TiffSlideSource
 from ibl2svs.writer import (
+    _build_macro_array,
     _build_label_array,
+    _build_thumbnail_array,
     _compute_svs_pyramid_shapes,
     finalize_svs_with_libtiff,
+    _svs_use_bigtiff,
+    write_aperio_associated_images,
     write_image,
     WriteImageError,
 )
@@ -68,7 +72,13 @@ class WriterTests(unittest.TestCase):
             result = convert_file(
                 sample,
                 output,
-                ConvertOptions(tile_size=16, output_format="svs", svs_finalize_with_libtiff=False, svs_validate_with_tiffinfo=False),
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                    svs_synthesize_associated_images=True,
+                ),
             )
             self.assertTrue(result.success)
             with mock.patch("ibl2svs.writer.subprocess.run", side_effect=FileNotFoundError()):
@@ -82,7 +92,59 @@ class WriterTests(unittest.TestCase):
         options = ConvertOptions(output_format="svs")
         shapes = _compute_svs_pyramid_shapes(SlideStub(), options)
 
-        self.assertEqual(shapes, [(39539, 15403), (19769, 7701), (9884, 3850), (4942, 1925), (2471, 962)])
+        self.assertEqual(shapes, [(39539, 15403), (9884, 3850), (4942, 1925)])
+
+    def test_svs_helpers_preserve_source_level_shapes(self) -> None:
+        class SlideStub:
+            width = 26858
+            height = 39428
+            source_container = "svs"
+            svs_level_dimensions = [(26858, 39428), (6714, 9857), (1678, 2464)]
+
+        self.assertEqual(
+            _compute_svs_pyramid_shapes(SlideStub(), ConvertOptions(output_format="svs")),
+            [(6714, 9857), (1678, 2464)],
+        )
+
+    def test_svs_auto_detects_all_j2k_compression_names(self) -> None:
+        options = ConvertOptions(output_format="svs")
+        for source_codec in (
+            "APERIO_JP2000_YCBC",
+            "APERIO_JP2000_RGB",
+            "JPEG_2000_LOSSY",
+            "JPEG2000",
+        ):
+            self.assertEqual(options.resolved_svs_codec(source_codec), "aperio_j2k")
+
+    def test_svs_bigtiff_estimate_uses_codec_quality_and_source_levels(self) -> None:
+        class SlideStub:
+            width = 50_000
+            height = 50_000
+            source_container = "svs"
+            svs_level_dimensions = [
+                (50_000, 50_000),
+                (12_500, 12_500),
+                (3_125, 3_125),
+                (1_562, 1_562),
+            ]
+
+        jpeg_slide = SlideStub()
+        jpeg_slide.source_codec = "JPEG"
+        self.assertFalse(
+            _svs_use_bigtiff(
+                jpeg_slide,
+                ConvertOptions(output_format="svs", main_quality=90, pyramid_quality=60),
+            )
+        )
+
+        j2k_slide = SlideStub()
+        j2k_slide.source_codec = "APERIO_JP2000_RGB"
+        self.assertTrue(
+            _svs_use_bigtiff(
+                j2k_slide,
+                ConvertOptions(output_format="svs", main_quality=100, pyramid_quality=100),
+            )
+        )
 
     def test_write_image_raises_on_streaming_direct_error(self) -> None:
         class SlideStub:
@@ -393,6 +455,53 @@ class WriterTests(unittest.TestCase):
             rendered_text = [call.args[1] for call in draw_factory.return_value.text.call_args_list]
             self.assertIn("Scanned: 2026-01-01 12:34:56", rendered_text)
 
+    def test_native_associated_images_keep_source_dimensions(self) -> None:
+        class NativeSlide:
+            def __init__(self) -> None:
+                self.images = {
+                    "thumbnail": Image.new("RGB", (3, 1), (10, 20, 30)),
+                    "macro": Image.new("RGB", (6, 2), (40, 50, 60)),
+                    "label": Image.new("RGB", (2, 5), (70, 80, 90)),
+                }
+
+            def get_native_associated_image(self, name: str) -> Image.Image:
+                return self.images[name]
+
+        slide = NativeSlide()
+        self.assertEqual(_build_thumbnail_array(slide).shape, (1, 3, 3))
+        self.assertEqual(_build_macro_array(slide).shape, (2, 6, 3))
+        self.assertEqual(_build_label_array(slide).shape, (5, 2, 3))
+
+    def test_svs_preserves_generic_associated_images_without_synthesis(self) -> None:
+        class GenericSlide:
+            path = Path("generic.svs")
+
+            def get_label_image(self) -> Image.Image:
+                return Image.new("RGB", (7, 4), (11, 22, 33))
+
+            def get_macro_image(self) -> Image.Image:
+                return Image.new("RGB", (5, 3), (44, 55, 66))
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output = Path(tempdir) / "associated.svs"
+            perf = {"thumbnail_sec": 0.0}
+            with tifffile.TiffWriter(str(output)) as tif:
+                metadata = write_aperio_associated_images(
+                    tif,
+                    GenericSlide(),
+                    ConvertOptions(output_format="svs", svs_synthesize_associated_images=False),
+                    perf,
+                    overall_done=0,
+                    overall_total=2,
+                )
+
+            self.assertEqual(metadata["svs_label_dimensions"], (7, 4))
+            self.assertEqual(metadata["svs_macro_dimensions"], (5, 3))
+            with tifffile.TiffFile(output) as tif:
+                self.assertEqual(len(tif.pages), 2)
+                self.assertIn("label", (tif.pages[0].description or "").lower())
+                self.assertIn("macro", (tif.pages[1].description or "").lower())
+
     def test_ome_tiff_pyramid_progress_keeps_accumulated_overall_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -437,7 +546,16 @@ class WriterTests(unittest.TestCase):
                 tile_height=256,
             )
 
-            result = convert_file(sample, output, ConvertOptions(tile_size=16, output_format="svs"))
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    main_quality=78,
+                    svs_synthesize_associated_images=True,
+                ),
+            )
 
             self.assertTrue(result.success)
             self.assertEqual(result.output_format, "svs")
@@ -449,20 +567,22 @@ class WriterTests(unittest.TestCase):
             self.assertIn(result.svs_finalize_backend, {"libtiff-tiffset", "none", "unavailable"})
             self.assertIsNotNone(result.svs_photometric_pages)
             with tifffile.TiffFile(output) as tif:
-                self.assertEqual(len(tif.pages), 7)
+                self.assertEqual(len(tif.pages), 6)
                 self.assertIn("Aperio Image Library", tif.pages[0].description or "")
+                self.assertIn("JPEG/RGB Q=78", tif.pages[0].description or "")
                 self.assertIn("Aperio Image Library", tif.pages[1].description or "")
                 self.assertTrue(tif.pages[0].is_tiled)
                 self.assertFalse(tif.pages[1].is_tiled)
                 self.assertTrue(tif.pages[2].is_tiled)
+                self.assertIn("JPEG/RGB Q=60", tif.pages[2].description or "")
                 self.assertTrue(tif.pages[3].is_tiled)
-                self.assertTrue(tif.pages[4].is_tiled)
+                self.assertIn("JPEG/RGB Q=60", tif.pages[3].description or "")
+                self.assertFalse(tif.pages[4].is_tiled)
                 self.assertFalse(tif.pages[5].is_tiled)
-                self.assertFalse(tif.pages[6].is_tiled)
-                self.assertIn("label", (tif.pages[5].description or "").lower())
-                self.assertIn("macro", (tif.pages[6].description or "").lower())
-                self.assertEqual(int(tif.pages[5].compression), 5)
-                self.assertEqual(int(tif.pages[6].compression), 7)
+                self.assertIn("label", (tif.pages[4].description or "").lower())
+                self.assertIn("macro", (tif.pages[5].description or "").lower())
+                self.assertEqual(int(tif.pages[4].compression), 5)
+                self.assertEqual(int(tif.pages[5].compression), 7)
 
     def test_convert_svs_to_ome_tiff_rebuilds_pyramid(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -474,7 +594,13 @@ class WriterTests(unittest.TestCase):
             first = convert_file(
                 sample,
                 svs_output,
-                ConvertOptions(tile_size=16, output_format="svs", svs_finalize_with_libtiff=False, svs_validate_with_tiffinfo=False),
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                    svs_synthesize_associated_images=True,
+                ),
             )
 
             result = convert_file(svs_output, tiff_output, ConvertOptions(tile_size=16))
@@ -509,7 +635,13 @@ class WriterTests(unittest.TestCase):
             result = convert_file(
                 tiff_output,
                 svs_output,
-                ConvertOptions(tile_size=16, output_format="svs", svs_finalize_with_libtiff=False, svs_validate_with_tiffinfo=False),
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_finalize_with_libtiff=False,
+                    svs_validate_with_tiffinfo=False,
+                    svs_synthesize_associated_images=True,
+                ),
             )
 
             self.assertTrue(first.success)
@@ -545,7 +677,11 @@ class WriterTests(unittest.TestCase):
             result = convert_file(
                 sample,
                 output,
-                ConvertOptions(tile_size=16, output_format="svs"),
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_synthesize_associated_images=True,
+                ),
                 progress_callback=lambda current, level, done, total, overall_done, overall_total: progress_events.append(
                     (level, done, total, overall_done, overall_total)
                 ),
@@ -633,13 +769,21 @@ class WriterTests(unittest.TestCase):
                 tile_height=256,
             )
 
-            result = convert_file(sample, output, ConvertOptions(tile_size=16, output_format="svs"))
+            result = convert_file(
+                sample,
+                output,
+                ConvertOptions(
+                    tile_size=16,
+                    output_format="svs",
+                    svs_synthesize_associated_images=True,
+                ),
+            )
 
             self.assertTrue(result.success)
             self.assertEqual(result.backend, "svs-streaming-direct")
-            self.assertEqual(result.pyramid_levels, 4)
+            self.assertEqual(result.pyramid_levels, 3)
             with tifffile.TiffFile(output) as tif:
-                self.assertEqual(len(tif.pages), 7)
+                self.assertEqual(len(tif.pages), 6)
                 # Main page
                 self.assertTrue(tif.pages[0].is_tiled)
                 self.assertEqual(int(tif.pages[0].subfiletype), 0)
@@ -650,20 +794,17 @@ class WriterTests(unittest.TestCase):
                 # 4x pyramid
                 self.assertTrue(tif.pages[2].is_tiled)
                 self.assertEqual(int(tif.pages[2].subfiletype), 0)
-                # 8x pyramid
+                # 16x pyramid
                 self.assertTrue(tif.pages[3].is_tiled)
                 self.assertEqual(int(tif.pages[3].subfiletype), 0)
-                # 16x pyramid
-                self.assertTrue(tif.pages[4].is_tiled)
-                self.assertEqual(int(tif.pages[4].subfiletype), 0)
                 # Label
-                self.assertFalse(tif.pages[5].is_tiled)
-                self.assertEqual(int(tif.pages[5].subfiletype), 1)
-                self.assertEqual(int(tif.pages[5].compression), 5)  # LZW
+                self.assertFalse(tif.pages[4].is_tiled)
+                self.assertEqual(int(tif.pages[4].subfiletype), 1)
+                self.assertEqual(int(tif.pages[4].compression), 5)  # LZW
                 # Macro
-                self.assertFalse(tif.pages[6].is_tiled)
-                self.assertEqual(int(tif.pages[6].subfiletype), 9)
-                self.assertEqual(int(tif.pages[6].compression), 7)  # JPEG
+                self.assertFalse(tif.pages[5].is_tiled)
+                self.assertEqual(int(tif.pages[5].subfiletype), 9)
+                self.assertEqual(int(tif.pages[5].compression), 7)  # JPEG
 
     def test_svs_streaming_direct_progress_includes_parse_ibl(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

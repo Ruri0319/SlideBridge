@@ -41,7 +41,7 @@ GitHub Release
 推送 v* 标签会触发 .github/workflows/release.yml，自动构建 Windows x64 NSIS 安装包和未签名 macOS DMG，并发布到 GitHub Release。
 
 示例：
-   git tag v0.4.5
+   git tag v0.5.0
    git push origin main --tags
 
 界面使用说明
@@ -52,7 +52,7 @@ GitHub Release
 4. 选择输出格式：Pyramidal OME-TIFF、明场 SVS、荧光 SVS 或 AFI。
 5. 如有未知荧光通道，按序号 C1/C2 继续，或修改本任务的通道定义。
 6. 混合批次存在不兼容文件时，明确选择“只转换兼容文件”或返回修改格式。
-7. 根据需要勾选“包含子文件夹”，然后点击“开始转换”。
+7. 根据需要勾选“扫描子文件夹”或“输出至新子文件夹”，然后点击“开始转换”。
 8. 在任务流、进度摘要和 transcript 日志中查看转换状态。
 9. 转换完成后可打开输出目录或 conversion_report.csv。
 

@@ -34,6 +34,62 @@ class WriteImageError(RuntimeError):
         self.perf = perf
 
 
+APERIO_LIBRARY_VERSION = "12.0.11"
+APERIO_JP2000_YCBC = 33003
+APERIO_IMAGE_DEPTH_TAG = 32997
+APERIO_JPEG_SUBSAMPLING = (2, 2)
+SVS_CLASSIC_TIFF_SAFE_LIMIT = 3_200_000_000
+SVS_TIFF_ESTIMATE_OVERHEAD = 64 * 1024 * 1024
+
+
+def _aperio_library_header(slide) -> str:
+    version = str(getattr(slide, "aperio_library_version", "") or APERIO_LIBRARY_VERSION).strip()
+    return f"Aperio Image Library v{version}"
+
+
+def _svs_codec(slide, options: ConvertOptions) -> str:
+    return options.resolved_svs_codec(getattr(slide, "source_codec", None))
+
+
+def _svs_tile_size(slide, options: ConvertOptions) -> int:
+    return options.resolved_svs_tile_size(getattr(slide, "source_codec", None))
+
+
+def _svs_quality(slide, options: ConvertOptions) -> int:
+    return max(1, min(100, int(options.main_quality)))
+
+
+def _svs_pyramid_quality(slide, options: ConvertOptions, level_index: int) -> int:
+    del level_index
+    return max(1, min(100, int(options.pyramid_quality)))
+
+
+def _svs_preview_quality(options: ConvertOptions) -> int:
+    return max(1, min(100, int(options.preview_quality)))
+
+
+def _svs_estimated_bytes_per_pixel(codec: str, quality: int) -> float:
+    """Estimate encoded tile density for the selected codec and quality."""
+    if codec == "aperio_j2k":
+        return 0.50 + 0.035 * quality
+    return 0.15 + 0.010 * quality
+
+
+def _svs_description_codec(slide, options: ConvertOptions, quality: int | None = None) -> str:
+    codec = _svs_codec(slide, options)
+    value = _svs_quality(slide, options) if quality is None else quality
+    return f"J2K/YUV16 Q={value}" if codec == "aperio_j2k" else f"JPEG/RGB Q={value}"
+
+
+def _svs_icc_profile(slide) -> bytes:
+    profile = getattr(slide, "icc_profile", None)
+    return bytes(profile) if isinstance(profile, bytes) else _get_srgb_icc_profile()
+
+
+def _svs_icc_name(slide) -> str:
+    return str(getattr(slide, "icc_profile_name", "") or "sRGB")
+
+
 def _load_tiff_runtime(*, require_imagecodecs: bool = True):
     try:
         import tifffile
@@ -97,18 +153,18 @@ def build_generic_description(slide: IBLSlide) -> str:
 
 
 def build_aperio_description(slide: IBLSlide, options: ConvertOptions) -> str:
-    tile_size = options.resolved_tile_size()
-    mpp_x, mpp_y = _mpp_xy(slide)
+    tile_size = _svs_tile_size(slide, options)
     return (
-        "Aperio Image Library v12.0.0 \r\n"
+        f"{_aperio_library_header(slide)} \r\n"
         f"{slide.width}x{slide.height} [0,0 {slide.width}x{slide.height}] "
-        f"({tile_size}x{tile_size}) JPEG/RGB Q={options.jpeg_quality}|"
+        f"({tile_size}x{tile_size}) {_svs_description_codec(slide, options)}|"
         f"AppMag = {slide.base_info.max_zoom_rate}|"
-        f"MPP = {slide.base_info.mpp:.6f}|"
-        f"MPP_X = {mpp_x:.6f}|MPP_Y = {mpp_y:.6f}|"
         f"Filename = {slide.path.stem}|"
+        f"MPP = {slide.base_info.mpp:.6f}|"
+        "DisplayColor = 0|"
         f"OriginalWidth = {slide.width}|"
-        f"OriginalHeight = {slide.height}"
+        f"OriginalHeight = {slide.height}|"
+        f"ICC Profile = {_svs_icc_name(slide)}"
     )
 
 
@@ -117,33 +173,37 @@ def build_aperio_pyramid_description(
     options: ConvertOptions,
     level_width: int,
     level_height: int,
+    quality: int | None = None,
 ) -> str:
-    tile_size = options.resolved_tile_size()
+    tile_size = _svs_tile_size(slide, options)
     return (
-        "Aperio Image Library v12.0.0 \r\n"
+        f"{_aperio_library_header(slide)} \r\n"
         f"{slide.width}x{slide.height} [0,0 {slide.width}x{slide.height}] "
-        f"({tile_size}x{tile_size}) -> {level_width}x{level_height} JPEG/RGB Q={options.jpeg_quality}"
+        f"({tile_size}x{tile_size}) -> {level_width}x{level_height} "
+        f"{_svs_description_codec(slide, options, quality=quality)}"
     )
 
 
 def build_aperio_thumbnail_description(slide: IBLSlide, width: int, height: int) -> str:
     return (
-        "Aperio Image Library v12.0.0 \n"
+        f"{_aperio_library_header(slide)} \n"
         f"{slide.width}x{slide.height} -> {width}x{height} - |"
         f"AppMag = {slide.base_info.max_zoom_rate}|"
-        f"MPP = {slide.base_info.mpp:.6f}|"
         f"Filename = {slide.path.stem}|"
+        f"MPP = {slide.base_info.mpp:.6f}|"
+        "DisplayColor = 0|"
         f"OriginalWidth = {slide.width}|"
-        f"OriginalHeight = {slide.height}"
+        f"OriginalHeight = {slide.height}|"
+        f"ICC Profile = {_svs_icc_name(slide)}"
     )
 
 
 def build_aperio_label_description(width: int, height: int) -> str:
-    return f"Aperio Image Library v12.0.0 \nlabel {width}x{height}"
+    return f"Aperio Image Library v{APERIO_LIBRARY_VERSION} \nlabel {width}x{height}"
 
 
 def build_aperio_macro_description(width: int, height: int) -> str:
-    return f"Aperio Image Library v12.0.0 \nmacro {width}x{height}"
+    return f"Aperio Image Library v{APERIO_LIBRARY_VERSION} \nmacro {width}x{height}"
 
 
 def _resolution_kwargs_for_mpp(
@@ -176,20 +236,22 @@ def _svs_use_bigtiff(slide: IBLSlide, options: ConvertOptions) -> bool:
     # better when we stay closer to that layout.
     #
     # Switch to BigTIFF automatically when the estimated output size could
-    # exceed Classic TIFF's 4 GB file-offset limit.  Estimate based on total
-    # pixels × 0.5 bytes/pixel (conservative JPEG Q=90) across all pyramid
-    # levels; use 3.2 GB as the safety threshold.
-    total_pixels = slide.width * slide.height
-    downsample = 2
-    while True:
-        downsample *= 2
-        w = max(1, slide.width // downsample)
-        h = max(1, slide.height // downsample)
-        if min(w, h) < 512:
-            break
-        total_pixels += w * h
-    estimated_bytes = total_pixels * 0.5
-    return estimated_bytes > 3_200_000_000
+    # exceed Classic TIFF's 4 GB file-offset limit.  Use the actual output
+    # levels and account for the codec and quality used on each level.
+    tile_size = _svs_tile_size(slide, options)
+    codec = _svs_codec(slide, options)
+    level_shapes = [(slide.width, slide.height), *_compute_svs_pyramid_shapes(slide, options)]
+    estimated_bytes = SVS_TIFF_ESTIMATE_OVERHEAD
+    for level_index, (width, height) in enumerate(level_shapes):
+        quality = (
+            _svs_quality(slide, options)
+            if level_index == 0
+            else _svs_pyramid_quality(slide, options, level_index - 1)
+        )
+        padded_pixels = tile_count(width, height, tile_size) * tile_size * tile_size
+        estimated_bytes += padded_pixels * _svs_estimated_bytes_per_pixel(codec, quality)
+
+    return estimated_bytes > SVS_CLASSIC_TIFF_SAFE_LIMIT
 
 
 def _get_srgb_icc_profile() -> bytes:
@@ -272,14 +334,14 @@ def _find_sof0_marker(data: bytes) -> int:
 def _encode_jpeg(data: np.ndarray, quality: int) -> bytes:
     """Encode an ndarray as an **RGB** self-contained JPEG byte-string.
 
-    Uses Adobe-style component IDs (R=82, G=71, B=66) so that decoders
-    recognise the data as RGB natively — no YCbCr round-trip.  This
-    matches the Aperio SVS ``JPEG/RGB`` convention found in ground-truth
-    CPTAC files.
+    Uses unlabelled RGB component IDs (0, 1, 2), which is the abbreviated
+    JPEG convention observed in the supplied Aperio ``JPEG/RGB`` tiles.
+    ``unknown`` keeps the input channels in RGB order without adding a JFIF
+    or Adobe APP marker.
     """
     from imagecodecs import jpeg8_encode
 
-    return jpeg8_encode(data, level=quality, colorspace="rgb", outcolorspace="rgb", optimize=False)
+    return jpeg8_encode(data, level=quality, colorspace="unknown", outcolorspace="unknown", optimize=False)
 
 
 def _encode_jpeg_stripped(data: np.ndarray, quality: int) -> tuple[bytes, bytes]:
@@ -317,6 +379,20 @@ def _get_jpeg_tables_for_shape(h: int, w: int, quality: int) -> bytes:
     return _extract_jpeg_tables(raw)
 
 
+def _encode_aperio_j2k(data: np.ndarray, quality: int) -> bytes:
+    from imagecodecs import JPEG2K, jpeg2k_encode
+
+    return bytes(
+        jpeg2k_encode(
+            np.ascontiguousarray(data),
+            level=quality,
+            codecformat=JPEG2K.CODEC.J2K,
+            colorspace=JPEG2K.CLRSPC.SYCC,
+            mct=True,
+        )
+    )
+
+
 class _EncodedTileIter:
     """Wrap a tile-ndarray iterator so it yields **stripped** JPEG bytes.
 
@@ -328,14 +404,18 @@ class _EncodedTileIter:
     tile, keeping per-tile decoder allocations to a minimum.
     """
 
-    def __init__(self, source, quality: int):
+    def __init__(self, source, quality: int, codec: str = "jpeg_rgb"):
         self._source = source
         self._quality = quality
+        self._codec = codec
 
     def __iter__(self):
         for tile in self._source:
-            _, stripped = _encode_jpeg_stripped(tile, self._quality)
-            yield stripped
+            if self._codec == "aperio_j2k":
+                yield _encode_aperio_j2k(tile, self._quality)
+            else:
+                _, stripped = _encode_jpeg_stripped(tile, self._quality)
+                yield stripped
 
 
 def build_aperio_svs_layout(slide: IBLSlide, options: ConvertOptions) -> dict[str, Any]:
@@ -437,6 +517,16 @@ def finalize_svs_with_libtiff(path: Path) -> str:
     with tifffile.TiffFile(str(path)) as tif:
         page_count = len(tif.pages)
     for index in range(page_count):
+        try:
+            proc = subprocess.run(
+                ["tiffset", "-d", str(index), "-s", str(APERIO_IMAGE_DEPTH_TAG), "1", str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return "unavailable"
+        cleaned = cleaned or proc.returncode == 0
         for tag in ("282", "283", "296", "305"):
             try:
                 proc = subprocess.run(
@@ -483,10 +573,12 @@ def inspect_svs_compatibility(path: Path) -> dict[str, Any]:
 
 
 def _compute_svs_pyramid_shapes(slide: IBLSlide, options: ConvertOptions) -> list[tuple[int, int]]:
+    source_dimensions = getattr(slide, "svs_level_dimensions", None)
+    if getattr(slide, "source_container", "") == "svs" and source_dimensions:
+        return [tuple(map(int, dimensions)) for dimensions in source_dimensions[1:]]
+
     shapes: list[tuple[int, int]] = []
-    downsample = 2
-    while True:
-        downsample *= 2  # 4, 8, 16, 32, 64, …
+    for downsample in (4, 16, 32):
         width = max(1, slide.width // downsample)
         height = max(1, slide.height // downsample)
         if min(width, height) < 512:
@@ -522,6 +614,23 @@ def _native_resource_image(slide, name: str) -> Image.Image | None:
     if not callable(getter):
         return None
     return getter()
+
+
+def _source_associated_image(slide, name: str) -> Image.Image | None:
+    native_getter = getattr(slide, "get_native_associated_image", None)
+    if callable(native_getter):
+        image = native_getter(name)
+        if image is not None:
+            return image
+
+    image = _native_resource_image(slide, name)
+    if image is not None:
+        return image
+
+    getter = getattr(slide, f"get_{name}_image", None)
+    if callable(getter):
+        return getter()
+    return None
 
 
 def _write_native_page(
@@ -790,6 +899,11 @@ def _write_native_ome_tiff(
 
 
 def _build_thumbnail_array(slide: IBLSlide, max_size: int = 1024) -> np.ndarray:
+    native_getter = getattr(slide, "get_native_associated_image", None)
+    native = native_getter("thumbnail") if callable(native_getter) else None
+    if native is not None:
+        return np.asarray(native.convert("RGB"), dtype=np.uint8)
+
     image = slide.get_thumbnail_image() or slide.get_preview_image()
     if image is None:
         sample_w = min(max_size, slide.width)
@@ -806,9 +920,16 @@ def _build_thumbnail_array(slide: IBLSlide, max_size: int = 1024) -> np.ndarray:
 
 
 def _build_macro_array(slide: IBLSlide, max_size: int = 1600) -> np.ndarray:
+    native_getter = getattr(slide, "get_native_associated_image", None)
+    native = native_getter("macro") if callable(native_getter) else None
+    if native is not None:
+        return np.asarray(native.convert("RGB"), dtype=np.uint8)
+
     macro_getter = getattr(slide, "get_macro_image", None)
     image = macro_getter() if callable(macro_getter) else None
-    # Prefer the native label/overview image stored in the IBL file.
+    overview_getter = getattr(slide, "get_overview_image", None)
+    if image is None and callable(overview_getter):
+        image = overview_getter()
     if image is None:
         image = slide.get_label_image()
     if image is None:
@@ -825,6 +946,11 @@ def _build_macro_array(slide: IBLSlide, max_size: int = 1600) -> np.ndarray:
 
 
 def _build_label_array(slide: IBLSlide) -> np.ndarray:
+    native_getter = getattr(slide, "get_native_associated_image", None)
+    native = native_getter("label") if callable(native_getter) else None
+    if native is not None:
+        return np.asarray(native.convert("RGB"), dtype=np.uint8)
+
     target_w = 666
     target_h = 716
     # Use the native label image as background when available.
@@ -879,42 +1005,55 @@ def write_aperio_associated_images(
     associated_total = _svs_associated_units(options)
     associated_done = 0
 
-    if _is_native_source(slide) and getattr(slide, "native_resource_status", "") == "native":
-        for name, enabled, subfiletype in (
-            ("label", options.svs_generate_label, 1),
-            ("macro", options.svs_generate_macro, 9),
-        ):
-            if not enabled:
-                continue
-            image = _native_resource_image(slide, name)
-            if image is None:
-                continue
-            perf["current_stage"] = "生成附属图像"
-            started = time.perf_counter()
-            width, height = _write_native_page(
-                tif,
-                image,
-                description=f"Aperio Image Library v12.0.0 \n{name} {image.width}x{image.height}",
-                subfiletype=subfiletype,
-            )
-            perf["thumbnail_sec"] += time.perf_counter() - started
-            metadata[f"svs_{name}_dimensions"] = (width, height)
-            associated_done += 1
-            _emit_progress(
-                progress_callback,
-                "生成附属图像",
-                associated_done,
-                max(1, associated_total),
-                overall_done + associated_done,
-                overall_total,
-            )
-        return metadata
+    source_images: dict[str, Image.Image] = {}
+    for name, enabled in (
+        ("label", options.svs_generate_label),
+        ("macro", options.svs_generate_macro),
+    ):
+        if enabled:
+            image = _source_associated_image(slide, name)
+            if image is not None:
+                source_images[name] = image
 
-    iccprofile = _get_srgb_icc_profile()
+    for name in ("label", "macro"):
+        image = source_images.get(name)
+        if image is None:
+            continue
+        perf["current_stage"] = "生成附属图像"
+        started = time.perf_counter()
+        width, height = _write_native_page(
+            tif,
+            image,
+            description=f"{_aperio_library_header(slide)} \n{name} {image.width}x{image.height}",
+            subfiletype=1 if name == "label" else 9,
+        )
+        perf["thumbnail_sec"] += time.perf_counter() - started
+        metadata[f"svs_{name}_dimensions"] = (width, height)
+        associated_done += 1
+        _emit_progress(
+            progress_callback,
+            "生成附属图像",
+            associated_done,
+            max(1, associated_total),
+            overall_done + associated_done,
+            overall_total,
+        )
 
-    macro_array = _build_macro_array(slide) if options.svs_generate_macro else None
+    macro_array = (
+        _build_macro_array(slide)
+        if (
+            options.svs_generate_macro
+            and "macro" not in source_images
+            and options.svs_synthesize_associated_images
+        )
+        else None
+    )
 
-    if options.svs_generate_label:
+    if (
+        options.svs_generate_label
+        and "label" not in source_images
+        and options.svs_synthesize_associated_images
+    ):
         perf["current_stage"] = "生成附属图像"
         label_started = time.perf_counter()
         label_array = _build_label_array(slide)
@@ -926,7 +1065,6 @@ def write_aperio_associated_images(
             description=build_aperio_label_description(label_array.shape[1], label_array.shape[0]),
             metadata=None,
             software="",
-            iccprofile=iccprofile,
             subfiletype=1,
         )
         perf["thumbnail_sec"] += time.perf_counter() - label_started
@@ -945,7 +1083,7 @@ def write_aperio_associated_images(
         perf["current_stage"] = "生成附属图像"
         macro_started = time.perf_counter()
         mh, mw = macro_array.shape[:2]
-        tables, stripped = _encode_jpeg_stripped(macro_array, options.jpeg_quality)
+        tables, stripped = _encode_jpeg_stripped(macro_array, _svs_preview_quality(options))
         tif.write(
             data=iter([stripped]),
             shape=(mh, mw, 3),
@@ -953,13 +1091,12 @@ def write_aperio_associated_images(
             photometric="rgb",
             compression="jpeg",
             compressionargs={"outcolorspace": "rgb"},
-            subsampling=(1, 1),
+            subsampling=APERIO_JPEG_SUBSAMPLING,
             jpegtables=tables,
             rowsperstrip=mh,
             description=build_aperio_macro_description(mw, mh),
             metadata=None,
             software="",
-            iccprofile=iccprofile,
             subfiletype=9,
         )
         perf["thumbnail_sec"] += time.perf_counter() - macro_started
@@ -977,14 +1114,21 @@ def write_aperio_associated_images(
     return metadata
 
 
-def _svs_common_kwargs(options: ConvertOptions) -> dict[str, Any]:
-    tile_size = options.resolved_tile_size()
+def _svs_common_kwargs(slide, options: ConvertOptions) -> dict[str, Any]:
+    tile_size = _svs_tile_size(slide, options)
+    if _svs_codec(slide, options) == "aperio_j2k":
+        return {
+            "photometric": "rgb",
+            "tile": (tile_size, tile_size),
+            "compression": APERIO_JP2000_YCBC,
+            "dtype": np.uint8,
+        }
     return {
         "photometric": "rgb",
         "tile": (tile_size, tile_size),
         "compression": "jpeg",
         "compressionargs": {"outcolorspace": "rgb"},
-        "subsampling": (1, 1),
+        "subsampling": APERIO_JPEG_SUBSAMPLING,
         "dtype": np.uint8,
     }
 
@@ -995,7 +1139,7 @@ def write_aperio_thumbnail_page(
     options: ConvertOptions,
     perf: dict[str, float],
     *,
-    iccprofile: bytes,
+    iccprofile: bytes | None,
     overall_done: int,
     overall_total: int,
     thumbnail_max: int,
@@ -1008,7 +1152,7 @@ def write_aperio_thumbnail_page(
         _write_native_page(
             tif,
             native,
-            description=f"Aperio Image Library v12.0.0 \nthumbnail {native.width}x{native.height}",
+            description=f"{_aperio_library_header(slide)} \nthumbnail {native.width}x{native.height}",
             subfiletype=1,
         )
         perf["thumbnail_sec"] += time.perf_counter() - thumb_started
@@ -1017,7 +1161,7 @@ def write_aperio_thumbnail_page(
 
     thumbnail = _build_thumbnail_array(slide, max_size=thumbnail_max)
     h, w = thumbnail.shape[:2]
-    tables, stripped = _encode_jpeg_stripped(thumbnail, options.jpeg_quality)
+    tables, stripped = _encode_jpeg_stripped(thumbnail, _svs_preview_quality(options))
     tif.write(
         data=iter([stripped]),
         shape=(h, w, 3),
@@ -1025,13 +1169,13 @@ def write_aperio_thumbnail_page(
         photometric="rgb",
         compression="jpeg",
         compressionargs={"outcolorspace": "rgb"},
-        subsampling=(1, 1),
+        subsampling=APERIO_JPEG_SUBSAMPLING,
         jpegtables=tables,
         rowsperstrip=h,
         description=build_aperio_thumbnail_description(slide, w, h),
         software="",
-        iccprofile=iccprofile,
         metadata=None,
+        subfiletype=0,
     )
     perf["thumbnail_sec"] += time.perf_counter() - thumb_started
     _emit_progress(progress_callback, "生成缩略图", 1, 1, overall_done + 1, overall_total)
@@ -1050,10 +1194,11 @@ def _write_svs_native_streaming(
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
     layout = build_aperio_svs_layout(slide, options)
     desired_levels = layout["pyramid"]
-    tile_size = options.resolved_tile_size()
+    tile_size = _svs_tile_size(slide, options)
     parallel = _resolve_parallel_settings(options)
     bigtiff = bool(layout["bigtiff"])
-    quality = options.jpeg_quality
+    codec = _svs_codec(slide, options)
+    quality = _svs_quality(slide, options)
     associated_units = _svs_associated_units(options)
     write_tail_total = _svs_write_tail_units(options)
     level_tiles = [tile_count(width, height, tile_size) for width, height in desired_levels]
@@ -1070,8 +1215,8 @@ def _write_svs_native_streaming(
     perf["current_stage"] = "解析 IMAGE"
     _emit_progress(progress_callback, "解析 IMAGE", 1, 1, overall_done, overall_total)
 
-    common = _svs_common_kwargs(options)
-    iccprofile = _get_srgb_icc_profile()
+    common = _svs_common_kwargs(slide, options)
+    iccprofile = _svs_icc_profile(slide)
     strip_height = max(tile_size, min(parallel["chunk_size"], tile_size * 2))
     strip_height = max(tile_size, (strip_height // tile_size) * tile_size)
 
@@ -1095,13 +1240,17 @@ def _write_svs_native_streaming(
         )
         started = time.perf_counter()
         tif.write(
-            data=iter(_EncodedTileIter(main_iter, quality)),
+            data=iter(_EncodedTileIter(main_iter, quality, codec)),
             shape=(slide.height, slide.width, 3),
             description=build_aperio_description(slide, options),
             software="",
             iccprofile=iccprofile,
             subfiletype=0,
-            jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+            jpegtables=(
+                _get_jpeg_tables_for_shape(tile_size, tile_size, quality)
+                if codec == "jpeg_rgb"
+                else None
+            ),
             **common,
         )
         perf["main_write_sec"] += time.perf_counter() - started
@@ -1112,7 +1261,7 @@ def _write_svs_native_streaming(
             slide,
             options,
             perf,
-            iccprofile=iccprofile,
+            iccprofile=None,
             overall_done=overall_done,
             overall_total=overall_total,
             thumbnail_max=layout["thumbnail_max"],
@@ -1122,7 +1271,8 @@ def _write_svs_native_streaming(
         for level_index, ((width, height), level_tile_count) in enumerate(zip(desired_levels, level_tiles), start=1):
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("转换已取消")
-            level_source, native_index = _native_level_source_for_shape(slide, width, height)
+            level_source, _ = _native_level_source_for_shape(slide, width, height)
+            level_quality = _svs_pyramid_quality(slide, options, level_index - 1)
             level_progress = ProgressState()
             level_iter = iter_source_tiles(
                 level_source,
@@ -1141,16 +1291,18 @@ def _write_svs_native_streaming(
             )
             started = time.perf_counter()
             tif.write(
-                data=iter(_EncodedTileIter(level_iter, quality)),
+                data=iter(_EncodedTileIter(level_iter, level_quality, codec)),
                 shape=(height, width, 3),
-                description=(
-                    build_aperio_pyramid_description(slide, options, width, height)
-                    + f"|NativeLevel = {native_index}"
+                description=build_aperio_pyramid_description(
+                    slide, options, width, height, quality=level_quality
                 ),
                 software="",
-                iccprofile=iccprofile,
                 subfiletype=0,
-                jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+                jpegtables=(
+                    _get_jpeg_tables_for_shape(tile_size, tile_size, level_quality)
+                    if codec == "jpeg_rgb"
+                    else None
+                ),
                 **common,
             )
             perf["pyramid_sec"] += time.perf_counter() - started
@@ -1210,7 +1362,7 @@ def _write_brightfield_ome_tiff_streaming(
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
     tile_size = options.resolved_tile_size()
     parallel = _resolve_parallel_settings(options)
-    quality = options.jpeg_quality
+    quality = options.main_quality
 
     # -- pyramid shape plan --
     pyramid_shapes = (
@@ -1426,10 +1578,10 @@ def _write_svs_streaming_direct(
 ) -> tuple[str, int, int]:
     """Single-pass streaming SVS writer — no temp files, no pyvips.
 
-    Reads IBL data exactly once.  Each strip is simultaneously fed as JPEG
-    tiles to the main page AND downsampled into a 4× accumulation buffer.
-    The 8× pyramid level is generated in-memory from the completed 4×
-    buffer.  No pyvips/libvips or intermediate temporary files needed.
+    Reads IBL data exactly once.  Each strip is simultaneously fed to the
+    main page AND downsampled into a 4× accumulation buffer.  The remaining
+    Aperio levels are generated from that buffer.  No pyvips/libvips or
+    intermediate temporary files are needed.
     """
     if _native_output_ready(slide):
         return _write_svs_native_streaming(
@@ -1444,11 +1596,12 @@ def _write_svs_streaming_direct(
     tifffile = _load_tiff_runtime(require_imagecodecs=True)
     layout = build_aperio_svs_layout(slide, options)
     desired_levels = layout["pyramid"]
-    tile_size = options.resolved_tile_size()
+    tile_size = _svs_tile_size(slide, options)
     parallel = _resolve_parallel_settings(options)
     bigtiff = bool(layout["bigtiff"])
     write_tail_total = _svs_write_tail_units(options)
-    quality = options.jpeg_quality
+    codec = _svs_codec(slide, options)
+    quality = _svs_quality(slide, options)
 
     perf["level_dimensions"] = [(slide.width, slide.height), *desired_levels]
     perf["svs_is_bigtiff"] = bigtiff
@@ -1480,8 +1633,8 @@ def _write_svs_streaming_direct(
     first_level_w, first_level_h = desired_levels[0] if desired_levels else (1, 1)
     l4_buffer = np.zeros((first_level_h, first_level_w, 3), dtype=np.uint8)
 
-    iccprofile = _get_srgb_icc_profile()
-    common = _svs_common_kwargs(options)
+    iccprofile = _svs_icc_profile(slide)
+    common = _svs_common_kwargs(slide, options)
     strip_height = max(tile_size, min(parallel["chunk_size"], tile_size * 2))
     strip_height = max(tile_size, (strip_height // tile_size) * tile_size)
 
@@ -1512,7 +1665,7 @@ def _write_svs_streaming_direct(
             ),
         )
 
-        main_encoder = _EncodedTileIter(main_drive, quality)
+        main_encoder = _EncodedTileIter(main_drive, quality, codec)
         started = time.perf_counter()
         tif.write(
             data=iter(main_encoder),
@@ -1521,7 +1674,11 @@ def _write_svs_streaming_direct(
             software="",
             iccprofile=iccprofile,
             subfiletype=0,
-            jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+            jpegtables=(
+                _get_jpeg_tables_for_shape(tile_size, tile_size, quality)
+                if codec == "jpeg_rgb"
+                else None
+            ),
             **common,
         )
         perf["read_decode_sec"] += stats.get("read_decode_sec", 0.0)
@@ -1536,7 +1693,7 @@ def _write_svs_streaming_direct(
             slide,
             options,
             perf,
-            iccprofile=iccprofile,
+            iccprofile=None,
             overall_done=overall_offset,
             overall_total=overall_total,
             thumbnail_max=layout["thumbnail_max"],
@@ -1556,10 +1713,12 @@ def _write_svs_streaming_direct(
                 # First pyramid level (4×) — use buffer directly
                 level_source = PILImageSource(prev_image)
             else:
-                # Cascaded level — down-sample from the previous
+                # Cascaded level — down-sample from the previous level
                 level_resized = prev_image.resize((lw, lh), resample=Image.Resampling.BILINEAR)
                 prev_image = level_resized
                 level_source = PILImageSource(level_resized)
+
+            level_quality = _svs_pyramid_quality(slide, options, level_index)
 
             level_iter = iter_source_tiles(
                 level_source,
@@ -1577,16 +1736,21 @@ def _write_svs_streaming_direct(
                 ),
             )
 
-            level_encoder = _EncodedTileIter(level_iter, quality)
+            level_encoder = _EncodedTileIter(level_iter, level_quality, codec)
             started = time.perf_counter()
             tif.write(
                 data=iter(level_encoder),
                 shape=(lh, lw, 3),
-                description=build_aperio_pyramid_description(slide, options, lw, lh),
+                description=build_aperio_pyramid_description(
+                    slide, options, lw, lh, quality=level_quality
+                ),
                 software="",
-                iccprofile=iccprofile,
                 subfiletype=0,
-                jpegtables=_get_jpeg_tables_for_shape(tile_size, tile_size, quality),
+                jpegtables=(
+                    _get_jpeg_tables_for_shape(tile_size, tile_size, level_quality)
+                    if codec == "jpeg_rgb"
+                    else None
+                ),
                 **common,
             )
             perf["pyramid_sec"] += time.perf_counter() - started
@@ -1628,7 +1792,7 @@ def write_image(
 ) -> tuple[int, dict[str, float]]:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tile_size = options.resolved_tile_size()
+    tile_size = _svs_tile_size(slide, options) if options.output_format == "svs" else options.resolved_tile_size()
 
     if tile_size <= 0 or tile_size % 16 != 0:
         raise RuntimeError("JPEG 压缩的 TIFF tile_size 必须是 16 的正整数倍")
