@@ -65,10 +65,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install libjpeg-turbo --no-progress -y
-          $dll = Get-ChildItem -Path 'C:\libjpeg-turbo64', 'C:\Program Files\libjpeg-turbo' -Filter turbojpeg.dll -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $version = '3.2.0'
+          $installer = Join-Path $env:RUNNER_TEMP "libjpeg-turbo-$version-vc-x64.exe"
+          $url = "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$version/libjpeg-turbo-$version-vc-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "libjpeg-turbo installer failed with exit code $($process.ExitCode)" }
+          $dll = @(
+            'C:\libjpeg-turbo64\bin\turbojpeg.dll',
+            'C:\libjpeg-turbo\bin\turbojpeg.dll',
+            "$env:WINDIR\System32\turbojpeg.dll"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $dll) { throw 'turbojpeg.dll was not installed' }
-          "IBL2SVS_TURBOJPEG=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "IBL2SVS_TURBOJPEG=$dll" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Prepare Rust toolchain
         shell: bash
